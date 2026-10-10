@@ -206,6 +206,32 @@ def subst_vars(s, m: dict):
     return map_aff(s, lambda a: a.subs(m))
 
 
+def _remap_expr(e, buf, new, f):
+    if isinstance(e, Read):
+        return Read(new, f(e.idx)) if e.buf == buf else e
+    if isinstance(e, (Mul, Add)):
+        return type(e)(_remap_expr(e.a, buf, new, f), _remap_expr(e.b, buf, new, f))
+    if isinstance(e, CastE):
+        return CastE(e.dtype, _remap_expr(e.e, buf, new, f))
+    return e
+
+
+def remap_buf(s, buf: str, new: str, f):
+    """Redirect every access to `buf` (scalar reads/writes and window bases) to buffer `new`,
+    transforming the index tuple with f(idx) -> idx. Window sizes are unchanged."""
+    if isinstance(s, For):
+        return replace(s, body=tuple(remap_buf(x, buf, new, f) for x in s.body))
+    if isinstance(s, Assign):
+        rhs = _remap_expr(s.rhs, buf, new, f)
+        return Assign(new, f(s.idx), rhs) if s.buf == buf else Assign(s.buf, s.idx, rhs)
+    if isinstance(s, Reduce):
+        rhs = _remap_expr(s.rhs, buf, new, f)
+        return Reduce(new, f(s.idx), rhs) if s.buf == buf else Reduce(s.buf, s.idx, rhs)
+    if isinstance(s, Call):
+        return Call(s.instr, tuple((r, Window(new, f(w.lo), w.size) if w.buf == buf else w) for r, w in s.args), s.attrs)
+    return s
+
+
 def map_stmts(stmts, f):
     """Bottom-up rewrite: f(stmt) -> stmt | tuple[stmt] | None (None keeps; tuple splices)."""
     out = []

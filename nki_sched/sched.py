@@ -1,0 +1,473 @@
+"""Schedule primitives. Each primitive is a checked rewrite of the ns-level loop IR (Exo style):
+it validates its own precondition, rebuilds the affected part of the immutable program, and
+records a history entry. v0 handles are unique loop / buffer names resolved against the current
+program on every call (a renamed or consumed name raises an error that says what replaced it).
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import Callable, Optional
+
+from . import ir
+from .analysis import AnalysisError, const_int, injective, loop_ranges, region
+from .emit import emit_nki
+from .expr import Aff, Var, var
+from .hw import INSTRS, NC_DEFAULT, HardwareConfig
+from .lower import HardwareError, check_hw, copy_nest_to_call, infer_kinds, nest_window
+
+
+class ScheduleError(Exception):
+    pass
+
+
+def _chain(loop: ir.For):
+    """Maximal perfect loop chain starting at `loop` (each body exactly one For)."""
+    out = [loop]
+    while len(out[-1].body) == 1 and isinstance(out[-1].body[0], ir.For):
+        out.append(out[-1].body[0])
+    return out
+
+
+def _rebuild_chain(loops, inner_body, order):
+    body = inner_body
+    for l in reversed(order):
+        body = (replace(l, body=tuple(body)),)
+    return body[0]
+
+
+class Sched:
+    def __init__(self, proc: ir.Proc, hw: HardwareConfig = NC_DEFAULT, check: Optional[Callable] = None):
+        self.proc = proc
+        self.hw = hw
+        self.history = [("init", proc)]
+        self._renamed = {}
+        self._check = check
+        self.notes = []  # e.g. reassociation notices
+
+    # ------------------------------------------------------------------ plumbing
+    def _commit(self, label: str, proc: ir.Proc):
+        try:
+            check_hw(proc, self.hw)
+        except HardwareError as e:
+            raise ScheduleError(f"{label}: {e}") from None
+        if self._check is not None:
+            try:
+                self._check(proc)
+            except Exception as e:  # semantic regression detected by differential testing
+                raise ScheduleError(f"{label}: result no longer matches the oracle: {e}") from None
+        self.proc = proc
+        self.history.append((label, proc))
+
+    def _find(self, var_name: str) -> ir.For:
+        l = ir.find_loop(self.proc.body, var_name)
+        if l is None:
+            if var_name in self._renamed:
+                raise ScheduleError(f"loop '{var_name}' no longer exists: it was split into {self._renamed[var_name]}; use one of those")
+            names = ir.loop_vars(self.proc.body)
+            raise ScheduleError(f"no loop named '{var_name}'. Loops: {names}")
+        return l
+
+    def _buf(self, name: str) -> ir.Buffer:
+        b = ir.buffers_of(self.proc).get(name)
+        if b is None:
+            raise ScheduleError(f"no buffer named '{name}'. Buffers: {list(ir.buffers_of(self.proc))}")
+        return b
+
+    def _fresh(self, name: str):
+        if name in ir.buffers_of(self.proc) or name in ir.loop_vars(self.proc.body):
+            raise ScheduleError(f"name '{name}' is already in use")
+
+    def _rewrite_loop(self, var_name, fn):
+        """Replace the For named var_name by fn(For) -> tuple of statements."""
+        done = []
+
+        def rec(stmts):
+            out = []
+            for s in stmts:
+                if isinstance(s, ir.For):
+                    if s.var == var_name:
+                        done.append(1)
+                        out.extend(fn(s))
+                        continue
+                    s = replace(s, body=tuple(rec(s.body)))
+                out.append(s)
+            return out
+
+        body = tuple(rec(self.proc.body))
+        if not done:
+            raise ScheduleError(f"no loop named '{var_name}'")
+        return self.proc.with_(body=body)
+
+    # ------------------------------------------------------------------ inspection
+    def loops(self, stage: str):
+        """Loop variable names of a stage's update nest, outermost first."""
+        for s in ir.walk(self.proc.body):
+            if isinstance(s, ir.For) and s.stage == stage:
+                return [l.var for l in _chain(s)]
+        raise ScheduleError(f"no stage '{stage}'")
+
+    def show(self):
+        return str(self.proc)
+
+    def source(self) -> str:
+        return emit_nki(self.proc, self.hw)
+
+    # ------------------------------------------------------------------ split
+    def split(self, loop: str, factor: int, names=None, perfect: bool = False):
+        """i -> (io, ii) with i = io*factor + ii. If the extent is not provably divisible by
+        `factor`, perfect=True records the assumption `extent % factor == 0` (emitted as an assert)."""
+        if not isinstance(factor, int) or factor < 1:
+            raise ScheduleError("split factor must be a positive int")
+        l = self._find(loop)
+        o, i = names or (f"{loop}.o", f"{loop}.i")
+        self._fresh(o)
+        self._fresh(i)
+        ext = l.extent
+        provable = (ext.is_const and ext.const % factor == 0) or (
+            ext.terms and ext.const % factor == 0 and all(c % factor == 0 for _, c in ext.terms))
+        assumptions = self.proc.assumptions
+        if ext.is_const and ext.const % factor:
+            raise ScheduleError(f"split({loop}, {factor}): the constant extent {ext.const} is not a multiple of {factor} (tail='cut' not implemented yet)")
+        if not provable:
+            if not perfect:
+                raise ScheduleError(
+                    f"split({loop}, {factor}): cannot prove {ext} is a multiple of {factor}. "
+                    f"Pass perfect=True to assume it (the kernel will assert it), or use tail='cut' (not implemented yet)."
+                )
+            a = ir.Assumption(ext, factor)
+            if a not in assumptions:
+                assumptions = assumptions + (a,)
+
+        def fn(f: ir.For):
+            body = tuple(ir.subst_vars(b, {loop: var(o) * factor + var(i)}) for b in f.body)
+            inner = ir.For(i, Aff(factor), body, f.stage, f.kind)
+            return (ir.For(o, ext // factor, (inner,), f.stage, f.kind),)
+
+        p = self._rewrite_loop(loop, fn).with_(assumptions=assumptions)
+        self._renamed[loop] = (o, i)
+        self._commit(f"split({loop}, {factor})", p)
+        return o, i
+
+    # ------------------------------------------------------------------ reorder
+    def reorder(self, *loops: str):
+        """Permute a perfectly nested chain of loops into the given order (outermost first)."""
+        if len(set(loops)) != len(loops) or len(loops) < 2:
+            raise ScheduleError("reorder needs two or more distinct loops")
+        ls = [self._find(n) for n in loops]
+        # outermost = the one that contains all the others
+        top = None
+        for cand in ls:
+            if {l.var for l in _chain(cand)} >= set(loops):
+                top = cand
+                break
+        if top is None:
+            raise ScheduleError(f"reorder{loops}: loops are not a perfectly nested contiguous chain "
+                                f"(each must be the only statement of the one above)")
+        chain = _chain(top)
+        names = [l.var for l in chain]
+        n = len(loops)
+        if set(names[:n]) != set(loops):
+            raise ScheduleError(f"reorder{loops}: loops must be the outermost {n} loops of the chain {names}")
+        head = chain[:n]
+        inner_body = chain[n - 1].body
+        by_name = {l.var: l for l in head}
+        # rectangular: no loop extent depends on another loop var of the chain
+        for l in head:
+            if l.extent.free_vars() & set(loops):
+                raise ScheduleError(f"reorder: extent of {l.var} ({l.extent}) depends on another loop in the nest")
+        self._check_reorder_legal(head, inner_body, loops)
+        new = _rebuild_chain(head, inner_body, [by_name[x] for x in loops])
+        p = self._rewrite_loop(top.var, lambda f: (new,))
+        self._commit(f"reorder{tuple(loops)}", p)
+
+    def _check_reorder_legal(self, head, inner_body, new_order):
+        P = {l.var: l.extent for l in head}
+        if [l.var for l in head] == list(new_order):
+            return
+        bufs = ir.buffers_of(self.proc)
+        inner_allocs = {s.buf.name for s in ir.walk(inner_body) if isinstance(s, ir.Alloc)}
+        acc = {}
+        for s in ir.walk(inner_body):
+            for mode, buf, loc in ir.accesses(s):
+                acc.setdefault(buf, []).append((mode, loc))
+        for buf, lst in acc.items():
+            if buf in inner_allocs or not any("w" in m for m, _ in lst):
+                continue
+            keys = {(loc.lo, loc.size) if isinstance(loc, ir.Window) else tuple(loc) for _, loc in lst}
+            if len(keys) != 1:
+                raise ScheduleError(f"reorder{tuple(new_order)}: cannot prove independence — '{buf}' is accessed at different indices "
+                                    f"inside the nest: {sorted(str(k) for k in keys)}")
+            key = next(iter(keys))
+            idx = key[0] if isinstance(lst[0][1], ir.Window) else key
+            appears = {v: P[v] for v in P if any(v in e.free_vars() for e in idx)}
+            missing = [v for v in P if v not in appears]
+            if appears and not injective(tuple(idx), appears):
+                raise ScheduleError(f"reorder{tuple(new_order)}: cannot prove distinct iterations write distinct elements of '{buf}' (index {[str(e) for e in idx]})")
+            if missing:
+                bad = [m for m, _ in lst if m not in ("rw",)]
+                if bad:
+                    raise ScheduleError(
+                        f"reorder{tuple(new_order)}: loop(s) {missing} do not index '{buf}', so they carry a dependence through it, "
+                        f"and '{buf}' is not purely accumulated (+=) inside the nest. Reordering is only legal for associative reductions; "
+                        f"separate the initialisation/readers of '{buf}' from this nest first (compute_at / fission)."
+                    )
+                self.notes.append(f"reorder{tuple(new_order)} reassociates the floating-point reduction into '{buf}'")
+
+    # ------------------------------------------------------------------ compute_at
+    def compute_at(self, stage: str, at: str):
+        """Move the producer stage's loop nests (and its allocation) inside loop `at`, restricted to
+        the region the consumers inside `at` actually read (interval analysis)."""
+        at_loop = self._find(at)
+        root = list(self.proc.body)
+        prod_idx = [i for i, s in enumerate(root) if isinstance(s, ir.For) and s.stage in (stage, stage + ".init")]
+        if not prod_idx:
+            raise ScheduleError(f"stage '{stage}' has no loop nests at the top level (already computed_at somewhere?)")
+        prods = [root[i] for i in prod_idx]
+        buf = self._buf(stage)
+        # consumer accesses
+        reads = []
+        for s in ir.walk(at_loop.body):
+            if isinstance(s, (ir.Assign, ir.Reduce)):
+                reads += [r.idx for r in ir.expr_reads(s.rhs) if r.buf == stage]
+        if not reads:
+            raise ScheduleError(f"compute_at({stage}, at={at}): no reads of '{stage}' inside loop '{at}'")
+        try:
+            lo, size = region(reads, loop_ranges(at_loop.body))
+        except AnalysisError as e:
+            raise ScheduleError(f"compute_at({stage}, at={at}): {e}") from None
+        for z in size:
+            const_int(z, "required region size")
+
+        new_prods = []
+        for nest in prods:
+            writes = [loc for s in ir.walk((nest,)) for m, b, loc in ir.accesses(s) if b == stage and "w" in m]
+            widx = {tuple(w) for w in writes}
+            if len(widx) != 1:
+                raise ScheduleError(f"compute_at: producer nest writes '{stage}' at several index tuples")
+            widx = next(iter(widx))
+            mapping, ext_of = {}, {}
+            for d, e in enumerate(widx):
+                if len(e.terms) != 1 or e.const != 0 or e.terms[0][1] != 1 or not isinstance(e.terms[0][0], Var):
+                    raise ScheduleError(f"compute_at: producer write index {[str(x) for x in widx]} must be a plain loop variable per dim")
+                v = e.terms[0][0].name
+                mapping[v] = lo[d] + var(v)
+                ext_of[v] = size[d]
+            nest2 = ir.subst_vars(nest, mapping)
+
+            def setext(s):
+                if isinstance(s, ir.For):
+                    return replace(s, extent=ext_of.get(s.var, s.extent), body=tuple(setext(b) for b in s.body))
+                return s
+
+            nest2 = setext(nest2)
+            new_prods.append(nest2)
+        new_prods = [ir.remap_buf(n, stage, stage, lambda idx: tuple(i - l for i, l in zip(idx, lo))) for n in new_prods]
+        new_body_stmts = tuple(ir.remap_buf(b, stage, stage, lambda idx: tuple(i - l for i, l in zip(idx, lo))) for b in at_loop.body)
+        newbuf = buf.with_(shape=tuple(size))
+        new_at = replace(at_loop, body=(ir.Alloc(newbuf),) + tuple(new_prods) + new_body_stmts)
+
+        def rec(stmts):
+            out = []
+            for s in stmts:
+                if isinstance(s, ir.For):
+                    s = new_at if s.var == at else replace(s, body=tuple(rec(s.body)))
+                out.append(s)
+            return out
+
+        rest = [s for i, s in enumerate(root) if i not in prod_idx and not (isinstance(s, ir.Alloc) and s.buf.name == stage)]
+        p = self.proc.with_(body=tuple(rec(rest)))
+        self._commit(f"compute_at({stage}, at={at})", p)
+
+    # ------------------------------------------------------------------ memory
+    def set_memory(self, buf: str, mem: str):
+        if mem not in ir.MEMS:
+            raise ScheduleError(f"unknown memory {mem}")
+        b = self._buf(buf)
+        if b.role != "temp":
+            raise ScheduleError(f"set_memory: '{buf}' is a kernel argument/output and always lives in HBM")
+
+        def f(s):
+            if isinstance(s, ir.Alloc) and s.buf.name == buf:
+                return ir.Alloc(s.buf.with_(mem=mem))
+            return None
+
+        p = self.proc.with_(body=tuple(ir.map_stmts(self.proc.body, f)))
+        self._commit(f"set_memory({buf}, {mem})", p)
+
+    def _staging(self, tensor, at, mem, name, direction):
+        at_loop = self._find(at)
+        self._fresh(name)
+        tb = self._buf(tensor)
+        if direction == "in":
+            idxs = [r.idx for s in ir.walk(at_loop.body) if isinstance(s, (ir.Assign, ir.Reduce)) for r in ir.expr_reads(s.rhs) if r.buf == tensor]
+            if any(m != "r" for s in ir.walk(at_loop.body) for m, b, _ in ir.accesses(s) if b == tensor):
+                raise ScheduleError(f"stage_in({tensor}): '{tensor}' is also written inside '{at}'; use stage_out or restructure")
+        else:
+            acc = [(m, loc) for s in ir.walk(at_loop.body) for m, b, loc in ir.accesses(s) if b == tensor]
+            if any(m != "w" for m, _ in acc):
+                raise ScheduleError(f"stage_out({tensor}): '{tensor}' is also read inside '{at}' (needs a load as well; not supported yet)")
+            idxs = [tuple(loc) for _, loc in acc]
+        if not idxs:
+            raise ScheduleError(f"stage_{direction}({tensor}, at={at}): no accesses to '{tensor}' inside '{at}'")
+        try:
+            lo, size = region(idxs, loop_ranges(at_loop.body))
+        except AnalysisError as e:
+            raise ScheduleError(f"stage_{direction}({tensor}): {e}") from None
+        for z in size:
+            const_int(z, f"staged window of '{tensor}'")
+        nb = ir.Buffer(name, tuple(size), tb.dtype, mem, "temp")
+        full = ir.Window(name, tuple(Aff(0) for _ in size), tuple(size))
+        win = ir.Window(tensor, tuple(lo), tuple(size))
+        rebase = lambda idx: tuple(i - l for i, l in zip(idx, lo))
+        body = tuple(ir.remap_buf(b, tensor, name, rebase) for b in at_loop.body)
+        if direction == "in":
+            src_mem, dst_mem = tb.mem, mem
+            cp = self._copy_call(full, win, src_mem, dst_mem)
+            new_body = (ir.Alloc(nb), cp) + body
+        else:
+            cp = self._copy_call(win, full, mem, tb.mem)
+            new_body = (ir.Alloc(nb),) + body + (cp,)
+        new_at = replace(at_loop, body=new_body)
+        p = self._rewrite_loop(at, lambda f: (new_at,))
+        self._commit(f"stage_{direction}({tensor}, at={at}, {mem}, {name})", p)
+
+    @staticmethod
+    def _copy_call(dst: ir.Window, src: ir.Window, src_mem: str, dst_mem: str):
+        if ir.HBM in (src_mem, dst_mem):
+            if src_mem == dst_mem:
+                raise ScheduleError("HBM -> HBM staging copies are not supported")
+            return ir.Call("ns.sync.dma_copy", (("dst", dst), ("src", src)))
+        return ir.Call("ns.vector.tensor_copy", (("dst", dst), ("src", src)))
+
+    def stage_in(self, tensor: str, at: str, mem: str, name: str):
+        """cache_read: copy the window of `tensor` read inside loop `at` into a new buffer in
+        `mem` at the start of `at`'s body; accesses are redirected. The copy is created directly as
+        the right ns instruction (HBM->SBUF: ns.sync.dma_copy)."""
+        self._staging(tensor, at, mem, name, "in")
+        return name
+
+    def stage_out(self, tensor: str, at: str, mem: str, name: str):
+        """cache_write: writes to `tensor` inside `at` go to a new buffer in `mem`; the window is
+        copied out after `at`'s body."""
+        self._staging(tensor, at, mem, name, "out")
+        return name
+
+    # ------------------------------------------------------------------ instruction selection
+    def replace(self, loop: str, instr: str):
+        """Tensorize: replace the loop nest rooted at `loop` by an ns instruction call when the
+        nest matches the instruction's semantics (structural unification)."""
+        if instr not in INSTRS:
+            raise ScheduleError(f"unknown instruction {instr}; known: {list(INSTRS)}")
+        l = self._find(loop)
+        bufs = ir.buffers_of(self.proc)
+        if instr == "ns.tensor.matmul":
+            call = self._match_matmul(l)
+        else:
+            call = copy_nest_to_call(l, bufs)
+            if call is None or call.instr != instr:
+                raise ScheduleError(f"replace({loop}, {instr}): the nest is not a pure elementwise copy between compatible memories")
+        p = self._rewrite_loop(loop, lambda f: (call,))
+        self._commit(f"replace({loop}, {instr})", p)
+
+    def _match_matmul(self, l: ir.For) -> ir.Call:
+        chain = _chain(l)
+        if len(chain) != 3 or len(chain[-1].body) != 1 or not isinstance(chain[-1].body[0], ir.Reduce):
+            raise ScheduleError(f"replace(ns.tensor.matmul): '{l.var}' must root a perfect 3-loop nest around a single `+=`")
+        red = chain[-1].body[0]
+        if not (isinstance(red.rhs, ir.Mul) and isinstance(red.rhs.a, ir.Read) and isinstance(red.rhs.b, ir.Read)):
+            raise ScheduleError("replace(ns.tensor.matmul): the update must be dst[m,n] += a[k,m] * b[k,n]")
+        a, b = red.rhs.a, red.rhs.b
+        ext = {c.var: c.extent for c in chain}
+        vs = set(ext)
+
+        def vars_in(idx):
+            return {v for v in vs if any(v in e.free_vars() for e in idx)}
+
+        dv, av, bv = vars_in(red.idx), vars_in(a.idx), vars_in(b.idx)
+        ks = av & bv - dv
+        ms = dv & av - bv
+        ns_ = dv & bv - av
+        if len(ks) != 1 or len(ms) != 1 or len(ns_) != 1:
+            raise ScheduleError("replace(ns.tensor.matmul): cannot identify (k, m, n) loops from the access pattern")
+        k, m, n = next(iter(ks)), next(iter(ms)), next(iter(ns_))
+        wd, vd = nest_window(red.buf, red.idx, {m: ext[m], n: ext[n]})
+        wa, va = nest_window(a.buf, a.idx, {k: ext[k], m: ext[m]})
+        wb, vb = nest_window(b.buf, b.idx, {k: ext[k], n: ext[n]})
+        if wd is None or wa is None or wb is None:
+            raise ScheduleError("replace(ns.tensor.matmul): operand indices must be plain loop variables (plus offsets)")
+        if [x for x in vd if x] != [m, n]:
+            raise ScheduleError(f"replace(ns.tensor.matmul): dst must be indexed [m, n], found order {vd}")
+        if [x for x in va if x] != [k, m]:
+            raise ScheduleError(f"replace(ns.tensor.matmul): stationary operand must be laid out [k, m] (contraction on the partition axis); found {va}. "
+                                f"Stage a transposed copy of '{a.buf}' first.")
+        if [x for x in vb if x] != [k, n]:
+            raise ScheduleError(f"replace(ns.tensor.matmul): moving operand must be laid out [k, n]; found {vb}")
+        for v in (k, m, n):
+            const_int(ext[v], f"extent of {v}")
+        return ir.Call("ns.tensor.matmul", (("dst", wd), ("stationary", wa), ("moving", wb)), (("accumulate", True),))
+
+    def fold_init(self, buf: str):
+        """Drop the zero-initialisation nest of an accumulator: the first matmul into a freshly
+        allocated PSUM tile overwrites (accumulate=None)."""
+        b = self._buf(buf)
+        if b.mem != ir.PSUM:
+            raise ScheduleError(f"fold_init({buf}): only valid for PSUM accumulators (it is in {b.mem})")
+        bufs = ir.buffers_of(self.proc)
+        found = {}
+
+        def is_init(s):
+            if not (isinstance(s, ir.For) and s.stage == buf + ".init"):
+                return False
+            ch = _chain(s)
+            inner = ch[-1].body
+            if len(inner) != 1 or not isinstance(inner[0], ir.Assign) or inner[0].buf != buf or inner[0].rhs != ir.Lit(0.0):
+                return False
+            w, _ = nest_window(buf, inner[0].idx, {c.var: c.extent for c in ch})
+            return w is not None and w.is_full(bufs)
+
+        def rec(stmts):
+            out = []
+            for s in stmts:
+                if is_init(s):
+                    found["init"] = found.get("init", 0) + 1
+                    continue
+                if isinstance(s, ir.For):
+                    s = replace(s, body=tuple(rec(s.body)))
+                out.append(s)
+            return out
+
+        body = tuple(rec(self.proc.body))
+        if found.get("init") != 1:
+            raise ScheduleError(f"fold_init({buf}): expected exactly one full zero-initialisation nest, found {found.get('init', 0)}")
+        n_mm = []
+
+        def f(s):
+            if isinstance(s, ir.Call) and s.instr == "ns.tensor.matmul" and s.arg("dst").buf == buf:
+                if not s.arg("dst").is_full(bufs):
+                    raise ScheduleError(f"fold_init({buf}): matmul writes only part of '{buf}'; first-write-overwrite would be unsound")
+                n_mm.append(1)
+                return replace(s, attrs=tuple((k, v) for k, v in s.attrs if k != "accumulate") + (("accumulate", None),))
+            return None
+
+        body = tuple(ir.map_stmts(body, f))
+        if not n_mm:
+            raise ScheduleError(f"fold_init({buf}): no ns.tensor.matmul accumulates into '{buf}' (replace the update nest first)")
+        # every other access to buf must be a read after the matmuls (checked by the oracle step too)
+        self._commit(f"fold_init({buf})", self.proc.with_(body=body))
+
+    def mark(self, loop: str, kind: str):
+        """Assert (or force a more conservative) loop kind: affine | sequential | static."""
+        if kind not in ("affine", "sequential", "static"):
+            raise ScheduleError("kind must be affine|sequential|static")
+        self._find(loop)
+        if kind == "affine":
+            inferred = infer_kinds(self.proc)
+            got = ir.find_loop(inferred.body, loop).kind
+            if got != "affine":
+                raise ScheduleError(f"mark({loop}, affine): dependence analysis says this loop carries a dependence (inferred {got})")
+
+        def fn(f):
+            return (replace(f, kind=kind),)
+
+        self._commit(f"mark({loop}, {kind})", self._rewrite_loop(loop, fn))
