@@ -123,3 +123,19 @@ def test_oracle_catches_a_wrong_rewrite():
     s.proc = s.proc.with_(body=tuple(wrong))
     with pytest.raises(ScheduleError, match="no longer matches the oracle"):
         s.split("C.m", 4, perfect=True)
+
+
+def test_l5_hoist_checked_every_step():
+    s = mk()
+    schedules.l5(s, TINY)
+    bufs = ir.buffers_of(s.proc)
+    rb = bufs["rhs_sb"]
+    assert len(rb.shape) == 3 and rb.shape[0].const == 4 and rb.shape[2].const == 8  # [128, K/128, 512] shape pattern
+    assert "rhs_sb[0:+4, ko, 0:+8]" in str(s.proc)
+
+
+def test_hoist_rejects_non_tile_stride():
+    s = mk(check=False)
+    schedules.l4(s, TINY)
+    with pytest.raises(ScheduleError, match="already allocated"):
+        s.hoist("rhs_sb", to="ko")

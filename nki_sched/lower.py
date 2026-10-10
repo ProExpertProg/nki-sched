@@ -20,8 +20,9 @@ def check_hw(proc: ir.Proc, hw: HardwareConfig):
     bufs = ir.buffers_of(proc)
     for b in bufs.values():
         if b.mem in (ir.SBUF, ir.PSUM):
-            if not all(d.is_const for d in b.shape):
-                raise HardwareError(f"{b.name} ({b.mem}) has a non-constant shape {[str(d) for d in b.shape]}; on-chip tiles must be static")
+            if not b.shape[0].is_const or (b.mem == ir.PSUM and not all(d.is_const for d in b.shape)):
+                raise HardwareError(f"{b.name} ({b.mem}) has a non-constant shape {[str(d) for d in b.shape]}; the partition dim (axis 0) of on-chip tiles must be static"
+                                    + (" and PSUM tiles fully static" if b.mem == ir.PSUM else ""))
             p = b.shape[0].const
             if p > hw.pmax:
                 raise HardwareError(f"{b.name} @ {b.mem}: partition dimension (axis 0) is {p} > {hw.pmax}; split the loop feeding it or fold axis 0")
@@ -44,10 +45,14 @@ def check_hw(proc: ir.Proc, hw: HardwareConfig):
                     raise HardwareError(f"{s.instr}: argument '{role}' ({w.buf}) is in {bufs[w.buf].mem}, must be in {allowed}")
             if s.instr == "ns.tensor.matmul":
                 sta, mov, dst = (s.arg(r) for r in ("stationary", "moving", "dst"))
-                k, m = (z.const for z in sta.size)
-                k2, n = (z.const for z in mov.size)
-                if k != k2 or tuple(z.const for z in dst.size) != (m, n):
-                    raise HardwareError(f"{s.instr}: inconsistent shapes stationary[{k},{m}] moving[{k2},{n}] dst{[z.const for z in dst.size]}")
+                try:
+                    k, m = (z.const for z in sta.shape())
+                    k2, n = (z.const for z in mov.shape())
+                    dshape = tuple(z.const for z in dst.shape())
+                except (ValueError, AttributeError):
+                    raise HardwareError(f"{s.instr}: operand windows must be 2-D with constant sizes")
+                if k != k2 or dshape != (m, n):
+                    raise HardwareError(f"{s.instr}: inconsistent shapes stationary[{k},{m}] moving[{k2},{n}] dst{list(dshape)}")
                 if k > hw.pmax or m > hw.stationary_fmax or n > hw.moving_fmax:
                     raise HardwareError(f"{s.instr}: tile k={k} m={m} n={n} exceeds caps ({hw.pmax}, {hw.stationary_fmax}, {hw.moving_fmax})")
 

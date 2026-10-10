@@ -204,6 +204,11 @@ class Sched:
             missing = [v for v in P if v not in appears]
             if appears and not injective(tuple(idx), appears):
                 raise ScheduleError(f"reorder{tuple(new_order)}: cannot prove distinct iterations write distinct elements of '{buf}' (index {[str(e) for e in idx]})")
+            if isinstance(lst[0][1], ir.Window):
+                w = lst[0][1]
+                for v in appears:
+                    if not any(w.lo[d].coef(v) and w.size[d].is_const and abs(w.lo[d].coef(v)) >= w.size[d].const for d in range(len(w.lo))):
+                        raise ScheduleError(f"reorder{tuple(new_order)}: windows written to '{buf}' by different iterations of '{v}' may overlap")
             if missing:
                 bad = [m for m, _ in lst if m not in ("rw",)]
                 if bad:
@@ -455,6 +460,118 @@ class Sched:
             raise ScheduleError(f"fold_init({buf}): no ns.tensor.matmul accumulates into '{buf}' (replace the update nest first)")
         # every other access to buf must be a read after the matmuls (checked by the oracle step too)
         self._commit(f"fold_init({buf})", self.proc.with_(body=body))
+
+    def hoist(self, buf: str, to: str):
+        """Re-stage `buf` (created by stage_in) at the outer loop `to`: its fill moves out of every
+        loop between `to` and the original site. Loops whose variable strides the source window by
+        exactly one tile (e.g. ko over K) *grow* the buffer: along the partition axis the tiles are
+        folded into a new axis 1 ([128, T, n]); along a free axis the buffer is enlarged. Loops that
+        do not index the source (e.g. mo for an rhs tile) simply reuse the data."""
+        to_loop = self._find(to)
+
+        def search(stmts, path):
+            for s in stmts:
+                if isinstance(s, ir.Alloc) and s.buf.name == buf:
+                    return path, stmts
+                if isinstance(s, ir.For):
+                    r = search(s.body, path + [s])
+                    if r:
+                        return r
+            return None
+
+        r = search(to_loop.body, [])
+        if r is None:
+            raise ScheduleError(f"hoist({buf}, to={to}): '{buf}' is not allocated inside loop '{to}'")
+        path, block = r
+        if not path:
+            raise ScheduleError(f"hoist({buf}, to={to}): '{buf}' is already allocated directly in '{to}'")
+        ob = self._buf(buf)
+        writers = [s for s in ir.walk(self.proc.body) if not isinstance(s, ir.For) for m, b, _ in ir.accesses(s) if b == buf and "w" in m]
+        if len(writers) != 1 or not isinstance(writers[0], ir.Call) or writers[0] not in block:
+            raise ScheduleError(f"hoist({buf}): expected a single fill (copy instruction) next to the allocation; found {len(writers)} writers")
+        fill = writers[0]
+        if not fill.arg("dst").is_full(ir.buffers_of(self.proc)):
+            raise ScheduleError(f"hoist({buf}): the fill must write the whole buffer")
+        src = fill.arg("src")
+        for s in ir.walk(to_loop.body):
+            if any(b == src.buf and "w" in m for m, b, _ in ir.accesses(s)):
+                raise ScheduleError(f"hoist({buf}): source '{src.buf}' is written inside '{to}'")
+        hv = {l.var: l.extent for l in path}
+        growth = {}  # var -> dim
+        for d, lo in enumerate(src.lo):
+            vs = [v for v in hv if lo.coef(v)]
+            if len(vs) > 1:
+                raise ScheduleError(f"hoist({buf}): several hoisted loops {vs} index dim {d} of the source")
+            if vs:
+                v = vs[0]
+                if not src.size[d].is_const or lo.coef(v) != src.size[d].const:
+                    raise ScheduleError(f"hoist({buf}): loop '{v}' strides the source window by {lo.coef(v)} but the tile is {src.size[d]} — not a whole-tile stride")
+                growth[v] = d
+        for v in hv:
+            if v not in growth and any(v in e.free_vars() for e in src.lo):
+                raise ScheduleError(f"hoist({buf}): source offsets depend on '{v}' non-affinely")
+        if sum(1 for d in growth.values() if d == 0) > 1:
+            raise ScheduleError(f"hoist({buf}): more than one hoisted loop grows the partition axis")
+        fold_v = next((v for v, d in growth.items() if d == 0), None)
+        sizes = list(ob.shape)
+        for v, d in growth.items():
+            if d != 0:
+                sizes[d] = sizes[d] * hv[v]
+        if fold_v is not None:
+            sizes.insert(1, hv[fold_v])
+        newbuf = ob.with_(shape=tuple(sizes))
+
+        def fidx(idx):
+            base = list(idx)
+            for v, d in growth.items():
+                if d != 0:
+                    base[d] = base[d] + var(v) * ob.shape[d].const
+            if fold_v is not None:
+                base.insert(1, var(fold_v))
+            return tuple(base)
+
+        def fwin(w):
+            lo = list(w.lo)
+            size = list(w.size)
+            pts = list(w.points)
+            for v, d in growth.items():
+                if d != 0:
+                    lo[d] = lo[d] + var(v) * ob.shape[d].const
+            if fold_v is not None:
+                lo.insert(1, var(fold_v))
+                size.insert(1, Aff(1))
+                pts = [p + 1 if p >= 1 else p for p in pts] + [1]
+            return ir.Window(w.buf, tuple(lo), tuple(size), tuple(sorted(pts)))
+
+        def remap(s):
+            if isinstance(s, ir.For):
+                return replace(s, body=tuple(remap(x) for x in s.body if not (x is fill or (isinstance(x, ir.Alloc) and x.buf.name == buf))))
+            if isinstance(s, (ir.Assign, ir.Reduce)):
+                rhs = ir._remap_expr(s.rhs, buf, buf, fidx)
+                if s.buf == buf:
+                    raise ScheduleError(f"hoist({buf}): scalar writes to the buffer are not supported")
+                return type(s)(s.buf, s.idx, rhs)
+            if isinstance(s, ir.Call):
+                return ir.Call(s.instr, tuple((rl, fwin(w) if w.buf == buf else w) for rl, w in s.args), s.attrs)
+            return s
+
+        # the new fill: one copy per tile of every growing loop, executed once at `to`
+        new_vars = {v: f"{v}_ld" for v in growth}
+        for nv in new_vars.values():
+            self._fresh(nv)
+        subs = {v: var(nv) for v, nv in new_vars.items()}
+        dst_lo = [Aff(0)] * len(ob.shape)
+        dst = ir.Window(buf, tuple(dst_lo), tuple(ob.shape))
+        dst = fwin(dst)
+        dst = ir.Window(dst.buf, tuple(l.subs(subs) for l in dst.lo), dst.size, dst.points)
+        srcw = ir.Window(src.buf, tuple(l.subs(subs) for l in src.lo), src.size, src.points)
+        stmt = ir.Call(fill.instr, (("dst", dst), ("src", srcw)), fill.attrs)
+        for v in reversed(list(growth)):
+            stmt = ir.For(new_vars[v], hv[v], (stmt,), "", "auto")
+        new_body = (ir.Alloc(newbuf), stmt) + tuple(remap(x) for x in to_loop.body)
+        new_to = replace(to_loop, body=new_body)
+        p = self._rewrite_loop(to, lambda f: (new_to,))
+        self._commit(f"hoist({buf}, to={to})", p)
 
     def mark(self, loop: str, kind: str):
         """Assert (or force a more conservative) loop kind: affine | sequential | static."""

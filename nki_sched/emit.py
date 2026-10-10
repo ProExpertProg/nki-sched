@@ -45,8 +45,8 @@ def window_src(w: ir.Window, bufs: dict) -> str:
     if w.is_full(bufs):
         return ident(w.buf)
     parts = []
-    for l, z in zip(w.lo, w.size):
-        parts.append(f"{aff(l)}:{aff(l + z)}")
+    for i, (l, z) in enumerate(zip(w.lo, w.size)):
+        parts.append(aff(l) if i in w.points else f"{aff(l)}:{aff(l + z)}")
     return f"{ident(w.buf)}[{', '.join(parts)}]"
 
 

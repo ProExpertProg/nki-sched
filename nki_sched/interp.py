@@ -76,11 +76,14 @@ class _State:
 
     def win(self, w: ir.Window):
         arr = self.bufs[w.buf]
-        sl = tuple(slice(int(l.eval(self.env)), int(l.eval(self.env)) + int(z.eval(self.env))) for l, z in zip(w.lo, w.size))
-        for s, n in zip(sl, arr.shape):
-            if s.start < 0 or s.stop > n:
-                raise InterpError(f"window out of bounds on {w.buf}: {sl} vs shape {arr.shape}")
-        return sl
+        sl = []
+        for i, (l, z) in enumerate(zip(w.lo, w.size)):
+            lo, n = int(l.eval(self.env)), arr.shape[i]
+            hi = lo + int(z.eval(self.env))
+            if lo < 0 or hi > n:
+                raise InterpError(f"window out of bounds on {w.buf}: dim {i} [{lo}:{hi}] vs shape {arr.shape}")
+            sl.append(lo if i in w.points else slice(lo, hi))
+        return tuple(sl)
 
     def idx(self, buf, idx):
         t = tuple(int(i.eval(self.env)) for i in idx)

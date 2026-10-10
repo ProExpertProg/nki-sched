@@ -36,10 +36,15 @@ class Window:
     buf: str
     lo: tuple
     size: tuple
+    points: tuple = ()  # dims indexed by an integer (size 1) that are dropped from the window's rank
 
     def is_full(self, buffers: dict) -> bool:
         b = buffers[self.buf]
-        return all(l == Aff(0) for l in self.lo) and tuple(self.size) == tuple(b.shape)
+        return not self.points and all(l == Aff(0) for l in self.lo) and tuple(self.size) == tuple(b.shape)
+
+    def shape(self) -> tuple:
+        """sizes of the dims that remain after dropping `points`"""
+        return tuple(z for i, z in enumerate(self.size) if i not in self.points)
 
 
 # ---------------------------------------------------------------- data expressions
@@ -196,7 +201,7 @@ def map_aff(s, f):
     if isinstance(s, Call):
         return Call(
             s.instr,
-            tuple((r, Window(w.buf, tuple(f(l) for l in w.lo), tuple(f(z) for z in w.size))) for r, w in s.args),
+            tuple((r, Window(w.buf, tuple(f(l) for l in w.lo), tuple(f(z) for z in w.size), w.points)) for r, w in s.args),
             s.attrs,
         )
     raise TypeError(s)
@@ -228,7 +233,7 @@ def remap_buf(s, buf: str, new: str, f):
         rhs = _remap_expr(s.rhs, buf, new, f)
         return Reduce(new, f(s.idx), rhs) if s.buf == buf else Reduce(s.buf, s.idx, rhs)
     if isinstance(s, Call):
-        return Call(s.instr, tuple((r, Window(new, f(w.lo), w.size) if w.buf == buf else w) for r, w in s.args), s.attrs)
+        return Call(s.instr, tuple((r, Window(new, f(w.lo), w.size, w.points) if w.buf == buf else w) for r, w in s.args), s.attrs)
     return s
 
 
@@ -296,12 +301,12 @@ def _e(e) -> str:
 
 
 def _w(w: Window) -> str:
-    def dim(l, z):
-        if z == Aff(1):
+    def dim(i, l, z):
+        if i in w.points:
             return str(l)
         return f"{l}:+{z}"
 
-    return f"{w.buf}[{', '.join(dim(l, z) for l, z in zip(w.lo, w.size))}]"
+    return f"{w.buf}[{', '.join(dim(i, l, z) for i, (l, z) in enumerate(zip(w.lo, w.size)))}]"
 
 
 def fmt(stmts, ind=0) -> str:

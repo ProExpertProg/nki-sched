@@ -18,3 +18,11 @@ def l4(s, hw):
     s.replace(ki, "ns.tensor.matmul")
     s.fold_init("acc")
     # the PSUM -> SBUF cast-out nest is recognised as a pure copy at emission (implicit selection)
+
+
+def l5(s, hw):
+    """Level 5: hoist the larger operand's loads out of the loop that doesn't index it.
+    rhs[:, no-strip] does not depend on mo, so with `no` outermost it is loaded once per no."""
+    l4(s, hw)
+    s.reorder("no", "mo")
+    s.hoist("rhs_sb", to="no")
