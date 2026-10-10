@@ -215,3 +215,59 @@ def test_golden_attention_emits_exactly_this_source(build_golden_attention):
 
 def test_golden_attention_is_valid_python(build_golden_attention):
     compile(emit_nki(build_golden_attention(), NC_DEFAULT), "<emitted>", "exec")
+
+
+# ================================================================ every instruction's NKI spelling
+def spelled(instr, roles, attrs=(), mems=None):
+    """the NKI line emitted for one call whose operands are whole buffers named after their roles"""
+    mems = mems or {}
+    bufs, wins = [], []
+    for r in roles:
+        dtype = "f32" if instr == "ns.tensor.matmul" and r == "dst" else "like:x"       # matmul accumulates in f32
+        b = ir.Buffer(r, (A(4), A(4)), dtype, mems.get(r, ir.SBUF))
+        bufs.append(ir.Alloc(b))
+        wins.append((r, ir.Window(r, (A(0), A(0)), b.shape)))
+    proc = tiny_proc(*bufs, ir.Call(instr, tuple(wins), tuple(attrs)))
+    line = [l for l in emit_nki(proc).splitlines() if "nisa." in l][-1]
+    return line.strip()
+
+
+@pytest.mark.parametrize("instr, roles, attrs, mems, expected", [
+    ("ns.tensor.matmul", ("dst", "stationary", "moving"), (("accumulate", None),), {"dst": ir.PSUM},
+     "nisa.nc_matmul(dst=dst, stationary=stationary, moving=moving)"),
+    ("ns.tensor.matmul", ("dst", "stationary", "moving"), (("accumulate", True),), {"dst": ir.PSUM},
+     "nisa.nc_matmul(dst=dst, stationary=stationary, moving=moving, accumulate=True)"),
+    ("ns.tensor.transpose", ("dst", "src"), (), {"dst": ir.PSUM}, "nisa.nc_transpose(dst=dst, data=src)"),
+    ("ns.vector.tensor_copy", ("dst", "src"), (), None, "nisa.tensor_copy(dst=dst, src=src)"),
+    ("ns.vector.tensor_copy", ("dst", "src"), (("engine", "vector"),), None, "nisa.tensor_copy(dst=dst, src=src, engine=nisa.vector_engine)"),
+    ("ns.vector.reduce_max", ("dst", "src"), (), None, "nisa.tensor_reduce(dst=dst, data=src, op=nl.maximum, axis=1)"),
+    ("ns.vector.reduce_sum", ("dst", "src"), (), None, "nisa.tensor_reduce(dst=dst, data=src, op=nl.add, axis=1)"),
+    ("ns.vector.scale", ("dst", "src"), (("c", 0.25),), None, "nisa.tensor_scalar(dst=dst, data=src, op0=nl.multiply, operand0=0.25)"),
+    ("ns.vector.scale", ("dst", "src"), (("c", ir.Param("my.scale")),), None,
+     "nisa.tensor_scalar(dst=dst, data=src, op0=nl.multiply, operand0=my_scale)"),
+    ("ns.vector.scale_rows", ("dst", "src", "vec"), (), None, "nisa.tensor_scalar(dst=dst, data=src, op0=nl.multiply, operand0=vec)"),
+    ("ns.vector.negate", ("dst", "src"), (), None, "nisa.tensor_scalar(dst=dst, data=src, op0=nl.multiply, operand0=-1.0)"),
+    ("ns.vector.reciprocal", ("dst", "src"), (), None, "nisa.reciprocal(dst=dst, data=src)"),
+    ("ns.scalar.exp", ("dst", "src"), (), None, "nisa.activation(dst=dst, data=src, op=nl.exp)"),
+    ("ns.scalar.exp_bias", ("dst", "src", "bias"), (), None, "nisa.activation(dst=dst, data=src, bias=bias, op=nl.exp)"),
+])
+def test_instruction_spelling(instr, roles, attrs, mems, expected):
+    assert spelled(instr, roles, attrs, mems) == expected
+
+
+def test_every_instruction_in_the_table_has_a_spelling_test():
+    from nki_sched.instrs import INSTRS
+    covered = {"ns.tensor.matmul", "ns.tensor.transpose", "ns.vector.tensor_copy", "ns.vector.reduce_max", "ns.vector.reduce_sum",
+               "ns.vector.scale", "ns.vector.scale_rows", "ns.vector.negate", "ns.vector.reciprocal", "ns.scalar.exp", "ns.scalar.exp_bias"}
+    assert set(INSTRS) - covered == {"ns.sync.dma_copy"}          # dma_copy is covered by the matmul golden kernels
+
+
+def test_bounds_scalars_and_params_become_the_kernels_preamble():
+    from nki_sched import scalar
+    D = sym("D")
+    proc = tiny_proc(copy_call(), assumptions=(ir.Bound(sym("N"), 64),),
+                     params=()).with_(fparams=(("s_rcp", scalar.SBin("div", scalar.SConst(1.0), scalar.SUn("sqrt", scalar.SSize(sym("N"))))),))
+    src = emit_nki(proc)
+    assert 'assert N <= 64, "expected N to be at most 64"' in src
+    assert "s_rcp = (1.0 / (N ** 0.5))" in src
+    assert src.index("assert N <= 64") < src.index("s_rcp =") < src.index("nl.ndarray")

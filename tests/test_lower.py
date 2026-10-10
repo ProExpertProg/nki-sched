@@ -204,3 +204,41 @@ def test_window_stores_by_different_iterations_must_not_overlap():
 def test_explicit_kinds_are_kept():
     nest = ir.For("i", A(3), (ir.Assign("y", (A(0),), ir.Lit(1.0)),), kind="affine")
     assert kinds(nest) == {"i": "affine"}  # the user asked; mark() is what checks the claim
+
+
+# ================================================================ transposes
+def transpose_call(src_shape=(4, 4), dst_shape=(4, 4), src_dtype="f32", dst_dtype="f32", src_mem=ir.SBUF, dst_mem=ir.PSUM):
+    allocs = (ir.Alloc(buf("s", *src_shape, mem=src_mem, dtype=src_dtype)), ir.Alloc(buf("d", *dst_shape, mem=dst_mem, dtype=dst_dtype)))
+    return prog(*allocs, ir.Call("ns.tensor.transpose", (("dst", win("d", *dst_shape)), ("src", win("s", *src_shape)))))
+
+
+def test_a_legal_transpose_passes():
+    check_hw(transpose_call(), NC_TINY)
+    check_hw(transpose_call((128, 64), (64, 128), "bf16", "bf16"), NC_DEFAULT)       # PSUM keeps the input dtype
+
+
+@pytest.mark.parametrize("kw, hw, message", [
+    (dict(dst_dtype="bf16"), NC_TINY, "must have the dtype of src"),
+    (dict(src_shape=(4, 8), dst_shape=(8, 4)), NC_TINY, "partition dimension"),   # the transposed dst would have 8 partitions
+    (dict(src_shape=(4, 4), dst_shape=(4, 8)), NC_TINY, "transposed shape"),
+    (dict(src_mem=ir.PSUM), NC_TINY, r"argument 'src' \(s\) is in PSUM"),
+    (dict(dst_mem=ir.SBUF), NC_TINY, r"argument 'dst' \(d\) is in SBUF"),
+])
+def test_illegal_transposes_are_rejected(kw, hw, message):
+    with pytest.raises(HardwareError, match=message):
+        check_hw(transpose_call(**kw), hw)
+
+
+def test_matmul_tile_caps_use_the_bounds_of_symbolic_sizes():
+    from nki_sched.expr import sym
+    S = sym("S")
+    sym_mm = prog(
+        ir.Alloc(ir.Buffer("d", (S, S), "f32", ir.PSUM)), ir.Alloc(ir.Buffer("a", (A(4), S), "f32", ir.SBUF)),
+        ir.Alloc(ir.Buffer("b", (A(4), S), "f32", ir.SBUF)),
+        ir.Call("ns.tensor.matmul", (("dst", ir.Window("d", (A(0), A(0)), (S, S))), ("stationary", ir.Window("a", (A(0), A(0)), (A(4), S))),
+                                     ("moving", ir.Window("b", (A(0), A(0)), (A(4), S))))))
+    with pytest.raises(HardwareError, match="not bounded"):
+        check_hw(sym_mm, NC_TINY)
+    check_hw(sym_mm.with_(assumptions=(ir.Bound(S, 4),)), NC_TINY)                       # S <= 4: a 4x4x4 matmul
+    with pytest.raises(HardwareError, match="exceeds caps"):
+        check_hw(sym_mm.with_(assumptions=(ir.Bound(S, 8),)), HardwareConfig(pmax=128, stationary_fmax=4, moving_fmax=4, psum_bank_bytes=4096))

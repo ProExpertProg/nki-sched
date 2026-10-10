@@ -114,6 +114,8 @@ class _State:
         if isinstance(e, ir.Un):
             return np.float32(UN[e.op](self.ev(e.a)))
         if isinstance(e, ir.Param):
+            if e.name not in self.fparams:
+                raise InterpError(f"unknown scalar parameter '{e.name}' (known: {sorted(self.fparams)})")
             return np.float32(self.fparams[e.name])
         if isinstance(e, ir.CastE):
             return quantize(self.resolve_dtype(e.dtype), np.float32(self.ev(e.e)))
@@ -140,7 +142,8 @@ def run(proc: ir.Proc, inputs: dict, reverse_affine: bool = False):
     "affine" run their iterations in reverse order (used to test loop-kind claims)."""
     st = _State(proc, inputs)
     st.reverse_affine = reverse_affine
-    _exec_block(st, proc.body)
+    with np.errstate(all="ignore"):  # overflow / invalid are real outcomes here; nan is caught when it is read
+        _exec_block(st, proc.body)
     return {b.name: st.bufs[b.name].copy() for b in proc.args if b.role == "out"}
 
 

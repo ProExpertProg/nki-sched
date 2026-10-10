@@ -259,3 +259,118 @@ def test_reverse_affine_only_reverses_affine_loops():
     with pytest.raises(interp.InterpError):
         interp.run(proc([y], body("affine")), {}, reverse_affine=True)
     assert list(interp.run(proc([y], body("affine")), {}, reverse_affine=False)["y"]) == [1.0, 2.0, 4.0]
+
+
+# ================================================================ expressions, reductions, parameters
+def scalar_proc(rhs, out_shape=(1,), idx=(A(0),)):
+    return proc([buf("y", *out_shape, role="out")], [ir.Assign("y", idx, rhs)])
+
+
+@pytest.mark.parametrize("op, a, b, expected", [
+    ("add", 1.5, 2.0, 3.5), ("sub", 1.5, 2.0, -0.5), ("mul", 1.5, 2.0, 3.0), ("div", 3.0, 2.0, 1.5), ("max", -1.0, 2.0, 2.0),
+])
+def test_binary_operators(op, a, b, expected):
+    out = interp.run(scalar_proc(ir.Bin(op, ir.Lit(a), ir.Lit(b))), {})["y"]
+    assert out[0] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("op, a, expected", [("neg", 2.0, -2.0), ("exp", 1.0, np.e), ("recip", 4.0, 0.25)])
+def test_unary_operators(op, a, expected):
+    assert interp.run(scalar_proc(ir.Un(op, ir.Lit(a))), {})["y"][0] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("op, init, expected", [("add", 0.0, 6.0), ("max", float("-inf"), 3.0)])
+def test_reductions_start_from_the_identity_and_combine_with_their_operator(op, init, expected):
+    x, y = buf("x", 3, role="arg"), buf("y", 1, role="out")
+    body = [ir.Assign("y", (A(0),), ir.Lit(init)), ir.For("i", A(3), (ir.Reduce("y", (A(0),), ir.Read("x", (i,)), op),))]
+    assert interp.run(proc([x, y], body), {"x": np.array([1.0, 2.0, 3.0], np.float32)})["y"][0] == expected
+
+
+def test_a_max_reduction_of_very_negative_values_needs_the_minus_inf_identity():
+    x, y = buf("x", 2, role="arg"), buf("y", 1, role="out")
+    body = [ir.Assign("y", (A(0),), ir.Lit(float("-inf"))), ir.For("i", A(2), (ir.Reduce("y", (A(0),), ir.Read("x", (i,)), "max"),))]
+    assert interp.run(proc([x, y], body), {"x": np.array([-1e30, -2e30], np.float32)})["y"][0] == np.float32(-1e30)
+
+
+def test_kernel_scalar_parameters_are_evaluated_from_the_sizes():
+    from nki_sched import scalar
+    n = sym("N")
+    x, y = buf("x", n, role="arg"), buf("y", n, role="out")
+    body = [ir.For("i", n, (ir.Assign("y", (i,), ir.Bin("mul", ir.Read("x", (i,)), ir.Param("s"))),))]
+    p = proc([x, y], body, sizes=[("N", "x", 0)]).with_(fparams=(("s", scalar.SBin("div", scalar.SConst(1.0), scalar.SSize(n))),))
+    np.testing.assert_allclose(interp.run(p, {"x": np.array([2.0, 4.0, 6.0, 8.0], np.float32)})["y"], [0.5, 1.0, 1.5, 2.0])
+
+
+def test_an_unknown_parameter_is_reported_by_name():
+    with pytest.raises(interp.InterpError, match=r"unknown scalar parameter 'nope'"):
+        interp.run(scalar_proc(ir.Param("nope")), {})
+
+
+def test_bounds_are_checked_like_divisibility_assumptions():
+    n = sym("N")
+    x = buf("x", n, role="arg")
+    p = proc([x], [], sizes=[("N", "x", 0)], assumptions=[ir.Bound(n, 4)])
+    interp.run(p, {"x": np.zeros(4, np.float32)})
+    with pytest.raises(interp.InterpError, match="assumption violated: N <= 4"):
+        interp.run(p, {"x": np.zeros(5, np.float32)})
+
+
+# ================================================================ the new instructions, against numpy
+def one_call(instr, out_shape, in_shapes, attrs=(), out_dtype="f32", out_mem="SBUF"):
+    """a program with a single instruction call over full windows; inputs are named by role"""
+    args = [buf(r, *shp, role="arg") for r, shp in in_shapes.items()]
+    dst = buf("dst", *out_shape, role="out", dtype=out_dtype)
+    full = lambda b: ir.Window(b.name, (A(0),) * len(b.shape), b.shape)  # noqa: E731
+    call = ir.Call(instr, (("dst", full(dst)),) + tuple((r, full(b)) for r, b in zip(in_shapes, args)), tuple(attrs))
+    return proc(args + [dst], [call])
+
+
+X = np.array([[1.0, -2.0, 3.0], [0.5, 4.0, -1.0]], np.float32)
+VEC = np.array([[2.0], [0.5]], np.float32)
+
+
+@pytest.mark.parametrize("instr, shapes, inputs, attrs, expected", [
+    ("ns.tensor.transpose", {"src": (2, 3)}, {"src": X}, (), X.T),
+    ("ns.vector.reduce_max", {"src": (2, 3)}, {"src": X}, (), X.max(1, keepdims=True)),
+    ("ns.vector.reduce_sum", {"src": (2, 3)}, {"src": X}, (), X.sum(1, keepdims=True)),
+    ("ns.vector.scale", {"src": (2, 3)}, {"src": X}, (("c", 0.5),), X * 0.5),
+    ("ns.vector.scale_rows", {"src": (2, 3), "vec": (2, 1)}, {"src": X, "vec": VEC}, (), X * VEC),
+    ("ns.vector.negate", {"src": (2, 3)}, {"src": X}, (), -X),
+    ("ns.vector.reciprocal", {"src": (2, 3)}, {"src": X}, (), 1.0 / X),
+    ("ns.scalar.exp", {"src": (2, 3)}, {"src": X}, (), np.exp(X)),
+    ("ns.scalar.exp_bias", {"src": (2, 3), "bias": (2, 1)}, {"src": X, "bias": -VEC}, (), np.exp(X - VEC)),
+])
+def test_instruction_handlers_compute_what_their_name_says(instr, shapes, inputs, attrs, expected):
+    out_shape = {"ns.tensor.transpose": (3, 2), "ns.vector.reduce_max": (2, 1), "ns.vector.reduce_sum": (2, 1)}.get(instr, (2, 3))
+    out = interp.run(one_call(instr, out_shape, shapes, attrs), inputs)["dst"]
+    np.testing.assert_allclose(out, expected, rtol=1e-6)
+
+
+def test_scale_takes_a_kernel_parameter_as_well_as_a_literal():
+    from nki_sched import scalar
+    p = one_call("ns.vector.scale", (2, 3), {"src": (2, 3)}, (("c", ir.Param("k")),)).with_(fparams=(("k", scalar.SConst(3.0)),))
+    np.testing.assert_allclose(interp.run(p, {"src": X})["dst"], X * 3.0)
+
+
+@pytest.mark.parametrize("instr, shapes, message", [
+    ("ns.vector.scale_rows", {"src": (2, 3), "vec": (2, 1)}, "operand 'vec' .* uninitialised"),
+])
+def test_instruction_operands_must_be_initialised(instr, shapes, message):
+    p = one_call(instr, (2, 3), {"src": shapes["src"]}).with_(body=())
+    uninit = buf("vec", 2, 1)
+    full = lambda b: ir.Window(b.name, (A(0),) * len(b.shape), b.shape)  # noqa: E731
+    src = buf("src", 2, 3, role="arg")
+    call = ir.Call(instr, (("dst", full(buf("dst", 2, 3, role="out"))), ("src", full(src)), ("vec", full(uninit))))
+    p = proc([src, buf("dst", 2, 3, role="out")], [ir.Alloc(uninit), call])
+    with pytest.raises(interp.InterpError, match=message):
+        interp.run(p, {"src": X})
+
+
+def test_an_instruction_result_must_fit_its_destination():
+    with pytest.raises(interp.InterpError, match="does not fit dst"):
+        interp.run(one_call("ns.tensor.transpose", (2, 3), {"src": (2, 3)}), {"src": X})     # needs (3, 2)
+
+
+def test_instruction_stores_round_to_the_destination_dtype():
+    out = interp.run(one_call("ns.vector.negate", (1, 1), {"src": (1, 1)}, out_dtype="bf16"), {"src": np.array([[1.0 + 2 ** -9]], np.float32)})["dst"]
+    assert out[0, 0] == -1.0

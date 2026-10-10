@@ -117,3 +117,43 @@ def test_printer_shows_loops_windows_points_and_assumptions(prog):
     assert "assume M % 4 == 0" in text
     assert "for i in 0..2:" in text and "t[j] += x[j, i]" in text
     assert "ns.sync.dma_copy(dst=b[0:+4, i, 0:+8]" in text
+
+
+# ================================================================ expressions added for attention
+def test_binary_and_unary_expressions_print_with_their_operators():
+    x = ir.Read("x", (i,))
+    y = ir.Read("y", (i,))
+    stmt = ir.Assign("o", (i,), ir.Un("exp", ir.Bin("add", ir.Bin("mul", x, ir.Param("s")), ir.Un("neg", y))))
+    assert ir.fmt((stmt,)) == "o[i] = exp((x[i] * s) + neg(y[i]))"
+    assert ir.fmt((ir.Assign("o", (i,), ir.Bin("max", x, ir.Lit(float("-inf")))),)) == "o[i] = max(x[i], -inf)"
+
+
+@pytest.mark.parametrize("op, text", [("add", "+="), ("max", "max=")])
+def test_reductions_print_their_operator(op, text):
+    assert ir.fmt((ir.Reduce("o", (i,), ir.Read("x", (i,)), op),)) == f"o[i] {text} x[i]"
+
+
+def test_mul_and_add_are_conveniences_for_bin():
+    assert ir.Mul(ir.Lit(1.0), ir.Lit(2.0)) == ir.Bin("mul", ir.Lit(1.0), ir.Lit(2.0))
+    assert ir.Add(ir.Lit(1.0), ir.Lit(2.0)) == ir.Bin("add", ir.Lit(1.0), ir.Lit(2.0))
+
+
+def test_reads_are_found_through_unary_and_binary_expressions_and_remapped():
+    e = ir.Un("exp", ir.Bin("add", ir.Read("x", (i,)), ir.Un("neg", ir.Read("y", (j,)))))
+    assert [r.buf for r in ir.expr_reads(e)] == ["x", "y"]
+    out = ir.remap_buf(ir.Assign("o", (i,), e), "y", "y2", lambda idx: tuple(k + 1 for k in idx))
+    assert [(r.buf, r.idx) for r in ir.expr_reads(out.rhs)] == [("x", (i,)), ("y2", (j + 1,))]
+
+
+def test_map_aff_and_subst_reach_inside_unary_and_reduce_ops():
+    st = ir.Reduce("o", (i,), ir.Un("exp", ir.Read("x", (i + 1,))), "max")
+    out = ir.subst_vars(st, {"i": j * 2})
+    assert out.op == "max" and out.idx == (j * 2,) and out.rhs.a.idx == (j * 2 + 1,)
+
+
+def test_the_proc_header_lists_bounds_assumptions_and_scalars():
+    from nki_sched import scalar
+    p = ir.Proc("p", (buf("x", 4, role="arg"),), (), (), assumptions=(ir.Bound(sym("S"), 128), ir.Assumption(sym("K"), 128)),
+                fparams=(("scale", scalar.SConst(0.5)),))
+    text = str(p)
+    assert "assume S <= 128; K % 128 == 0" in text and "scalars scale = 0.5" in text
