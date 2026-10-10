@@ -1,6 +1,6 @@
 # nki-sched — a scheduling language on top of NKI
 
-**Status: M0–M3 implemented for matmul (see §13); M4+ (multibuffer / pipeline / overlap, blocking, attention) is still plan.**
+**Status: M0–M3 implemented for matmul and M6 for single-head attention (see §13 and `docs/ATTENTION.md`); M4/M5 (multibuffer / pipeline / overlap, latency) and online softmax are still plan.**
 Companion docs: [`SYNTAX.md`](SYNTAX.md) (language draft with worked schedules), [`docs/PRIOR_ART.md`](docs/PRIOR_ART.md) (what was read, what we take from each).
 
 ---
@@ -247,7 +247,7 @@ Sync: none emitted (none exists in 0.6.0). A reserved pass `inject_sync` (TVM-st
 | **M3** | `hoist`, `fold_partition`, `split(tail="cut")`, capacity checks, traffic model | **A5, A6, A7** pass bars (1.6 / 1.25 / 1.05) |
 | **M4** | `multibuffer`, `pipeline`, `overlap`, `set_engine` | IR-level equivalence (interpreter); emitted kernels correct in simulator |
 | **M5** | Device runs on `seat-270` (baremetal + profile); sweep knobs `BM,BN,BK,depth`; record which primitives actually yield overlap | **A8**: latency table; written finding on whether NKI 0.6.0 overlaps rotated buffers |
-| **M6** | Attention: multi-stage `compute_at` (scores → softmax → PV), Vector/Scalar-engine instrs (`tensor_reduce`, `exponential`, `activation`, `tensor_scalar`), `nc_transpose` for Pᵀ; nkibench level 8 | numerics + "intermediate never leaves chip" traffic |
+| **M6** | Attention: `compute_at` chain (scores → softmax → PV), vector/scalar/tensor-engine instructions as a pattern table, transposed staging, `recip_divisor`; see `docs/ATTENTION.md` | **done** for single-head f32: `single_tile` (S, D ≤ 128) and `tiled` (S % 128 == 0); simulator + compile-only verified; NeuronCore pending |
 | **M7** (stretch) | Online-softmax / flash rewrite as a *verified algebraic rewrite* (it is not a pure loop transform — it changes the algorithm via rescaling), z3 for bounds, auto-tuner over knobs, text round-trip of IR / optional MLIR export | |
 
 ### Design implications of attention (so M1–M3 don't paint us into a corner)
@@ -270,22 +270,34 @@ Multiple stages with producer–consumer placement (`compute_at` generalises bey
 
 ## 13. Implementation status
 
-Code: `nki_sched/` (expr, ir, hw, interp, frontend, analysis, lower, sched, emit, verify), `tests/` (unit tests per module, no Neuron SDK and no nkibench needed), `examples/` (small examples that print the IR and the emitted NKI code, plus the matmul ladder), `scripts/` (integration against a Trainium node and against nkibench).
+Code: `nki_sched/` (expr, scalar, ir, hw, instrs, match, interp, frontend, analysis, lower, transforms, sched, emit, verify), `tests/` (unit tests per module; no Neuron SDK, no nkibench), `examples/` (small examples that print the IR and the emitted NKI code, the matmul ladder, attention), `scripts/` (node-side integration), `docs/ATTENTION.md`.
 
 | Milestone | State | Notes |
 |---|---|---|
-| M0 skeleton, interpreter, torch trace, naive IR | **done** | the frontend expands the exported ATen graph generically (matmul, transposes, casts); `HardwareConfig` values other than tile caps are `[unverified]` defaults |
+| M0 skeleton, interpreter, torch trace, naive IR | **done** | the frontend expands the exported ATen graph generically (matmul, transposes, casts, scalar mul/div, softmax, scaled-dot-product attention) with symbolic dims; `HardwareConfig` values other than tile caps are `[unverified]` defaults |
 | M1 core loop prims + differential testing | **done, simplified** | handles are unique names (no cursors/forwarding, no `s.find`); `split` supports only `perfect` (assumption → emitted assert), no `cut`/`guard`; no `fuse`/`unroll`; no property-based fuzzing |
-| M2 compute_at, staging, memory, replace, emitter | **done** | structural `replace` for matmul/copies (no general unification); interval analysis only |
+| M2 compute_at, staging, memory, replace, emitter | **done** | `replace` is table-driven (`instrs.INSTRS`: semantic patterns, one matcher); interval analysis only; `compute_at` also handles constant dims |
 | M3 hoist, traffic | **minimal** | `hoist` and a static `dma_bytes` traffic analysis exist; levels 5–7 of the ladder are examples that keep whole strips in SBUF and are **not** a blocking strategy |
 | M4 multibuffer / pipeline / overlap / set_engine | not started | no sync API in NKI 0.6.0 (verified) → these are reorderings + buffer rotation |
-| M5 device latency | not started | correctness on a NeuronCore was checked, performance was not |
-| M6 attention | not started | |
+| M5 device latency | not started | correctness on a NeuronCore was checked for matmul; performance was not (wall time is launch-dominated) |
+| M6 attention | **done (f32, single head)** | `single_tile` and `tiled`; K/V re-read per query tile, whole score row in SBUF, no online softmax, no bf16 (see `docs/ATTENTION.md`) |
 
-**Tests:** `pytest` runs 300+ tests in a few seconds: expression algebra, IR traversal/printing, interpreter semantics (dtypes, windows, matmul accumulate modes, error paths), region/injectivity analysis, hardware legality, copy recognition, loop-kind inference, the frontend over several specs (checked against torch), every primitive's structure and error messages, the emitter (exact golden source), the verification hooks, and the examples (including that the static HBM traffic of the ladder equals what nkibench measured). Every per-step oracle check also re-runs the program with affine loops iterated in reverse, so the inferred `affine` annotations are tested rather than trusted.
+**Tests:** `pytest` runs ~550 tests in well under a minute: expression and scalar algebra, IR traversal/printing, interpreter semantics (dtypes, windows, expressions, reductions, every instruction against numpy), region/injectivity/bounds analysis, hardware legality, copy recognition, loop-kind inference, the frontend over many specs checked against torch, the instruction table (the semantic pattern, the matcher and the interpreter handler of *every* instruction agree, in every loop order), every primitive's structure and error messages, the emitter (exact golden sources, every instruction's spelling), the verification hooks, and the examples (including that the static HBM traffic of the matmul ladder equals what nkibench measured). Every per-step oracle check also re-runs the program with affine loops iterated in reverse, and uses inputs with one large element (a softmax that forgets the row max is caught even at scale 1).
 
-**Integration (needs a Trainium node; not part of `pytest`):** `scripts/device_check.sh l4` emits a schedule, runs it through nkibench (rule scan, numerics, HBM-traffic bar), through `nki.simulate` with float32 and bfloat16 inputs, and compiles and runs it on the NeuronCore. `scripts/nkibench_rules.py` runs just nkibench's static rule scan anywhere nkibench.py is available.
+**Integration layers (need a Trainium node; not part of `pytest`)** — `scripts/device_check.sh <target>` runs, cheapest first:
+1. *compile only*: `neuronx-cc` through the standalone-kernel path with a no-op executor. Needs **no NeuronCore**, and catches what the hardware compiler rejects and the simulator accepts — e.g. `tensor_scalar(op0=nl.divide)`, which the simulator runs and the compiler refuses.
+2. `nki.simulate` against numpy (float32; matmul also bfloat16; attention also with inputs scaled ×30).
+3. nkibench (matmul levels only): rules, numerics, HBM-traffic bar. Its attention level (8) crashes in its own report (`KeyError: 'M'`), so attention does not use it.
+4. a real NeuronCore run (correctness only; wall time per call is launch-dominated, so no performance claim is made).
 
-**What was last verified on `seat-270`** (with the code in this repository, all four ladder schedules `l4`-`l7`): `nkibench` rules clean and numerics 4/4 at levels 4-7; the float32/bfloat16 `nki.simulate` check; and compiling with `neuronx-cc` and running on the NeuronCore in float32 and bfloat16 on the four shapes (correctness only). Wall time per call on a core is launch-dominated (about 1.6 s for every kernel and shape), so no performance claim is made.
+**What was verified, per layer:**
 
-**Known limits:** `perfect` splits are guarded only by an emitted assert; the dependence analysis is conservative and covers only the access shapes the matmul produces (affine boxes); floating-point reassociation is recorded in `Sched.notes` but not gated by a tolerance; the SBUF-footprint assert assumes 4 bytes per element and no buffer reuse.
+| | matmul `l4`–`l7` | attention `single_tile` | attention `tiled` |
+|---|---|---|---|
+| pytest (tiny fake chip, oracle after every primitive) | yes | yes | yes |
+| compile only (`neuronx-cc`) | yes (f32, bf16) | yes (4 shapes) | yes (4 shapes) |
+| simulator | yes (f32, bf16) | yes, incl. ×30 scores | yes, S = 128…512, incl. ×30 scores |
+| nkibench | levels 4–7 | n/a (see above) | n/a |
+| NeuronCore | yes, on the PR #1 code: `l5`–`l7` still emit **byte-identical** kernels; `l4` emits the same program with two independent loads swapped (compile-only, simulator and nkibench re-verified; the core run was not repeated) | **not run**: the cores were held by another job | **not run**, same reason |
+
+**Known limits:** `perfect` splits are guarded only by an emitted assert; the dependence analysis is conservative and covers only the access shapes the schedules produce (affine boxes); floating-point reassociation and `recip_divisor` are recorded in `Sched.notes` but not gated by a tolerance; the SBUF-footprint assert assumes 4 bytes per element and no buffer reuse; attention is float32 only and `tiled` needs `S % 128 == 0`.

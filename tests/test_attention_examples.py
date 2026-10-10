@@ -95,7 +95,15 @@ def test_single_tile_hbm_traffic_is_the_floor(attn):
 
 # ------------------------------------------------------------------ the example script
 def test_attention_example_prints_both_schedules(attn, capsys):
-    attn.main()
+    attn.main([])
     out = capsys.readouterr().out
     assert "single_tile" in out and "tiled" in out
     assert out.count("-- emitted NKI source:") == 2 and out.count("@nki.jit") == 2
+
+
+def test_attention_cli_writes_the_requested_kernel(attn, tmp_path, capsys):
+    out = tmp_path / "k.py"
+    attn.main(["tiled", str(out)])
+    text = out.read_text()
+    assert "def nki_attention_(q, k, v):" in text and "for qo in nl.affine_range(S // 128):" in text
+    assert "single_tile" not in capsys.readouterr().out          # only the requested schedule was built

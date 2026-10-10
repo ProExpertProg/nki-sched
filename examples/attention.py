@@ -10,8 +10,11 @@ the value matmul); a schedule then places every stage on the chip. Two schedules
                 (the transposes are 128x128 at most) and the value matmul accumulates over key chunks in
                 PSUM. Softmax is exact (the whole [128, S] row is in SBUF), not the online/flash variant.
 
-    python examples/attention.py            # prints the IR and the NKI kernel of each example
+    python examples/attention.py                         # prints the IR and the NKI kernel of each schedule
+    python examples/attention.py tiled kernel.py         # also writes the kernel
 """
+
+import argparse
 
 import torch
 
@@ -122,12 +125,29 @@ def tiled(s: Sched, hw: HardwareConfig):
     s.fold_init("matmul_1")
 
 
-def main():
-    for schedule in (single_tile, tiled):
-        c.banner(schedule)
-        s = new_attention_sched()
-        schedule(s, s.hw)
+SCHEDULES = {"single_tile": single_tile, "tiled": tiled}
+
+
+def build(name: str, hw: HardwareConfig = NC_DEFAULT) -> Sched:
+    s = new_attention_sched(hw)
+    SCHEDULES[name](s, hw)
+    return s
+
+
+def main(argv=None):
+    """no arguments: print every schedule's IR and kernel. With a schedule name and a file: write that kernel."""
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("schedule", nargs="?", choices=sorted(SCHEDULES))
+    ap.add_argument("out", nargs="?", help="write the emitted kernel here")
+    a = ap.parse_args(argv)
+    for name in [a.schedule] if a.schedule else SCHEDULES:
+        c.banner(SCHEDULES[name])
+        s = build(name)
         c.show(s)
+        if a.out:
+            with open(a.out, "w") as f:
+                f.write(s.source())
+            print(f"wrote {a.out}")
 
 
 if __name__ == "__main__":

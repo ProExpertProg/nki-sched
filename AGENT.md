@@ -79,3 +79,58 @@ successful call: read the loop and buffer names from it.
 A `ScheduleError` names the primitive and the violated rule; the report also gives the program state
 before the failing call and the calls that succeeded. Names that were split no longer exist: use
 the returned `o, i` names. Change only the failing call (and what depends on it).
+
+# Attention (`softmax(q k^T / sqrt(D)) v`, one head, float32)
+
+Same language, different starting program. `q`, `k`, `v` are `[S, D]`, output `O`; sizes `S`, `D` are symbolic.
+`hw` as before; never write 128/512 literally.
+
+```
+matmul        S = q k^T                f32 accumulator (init nest + update nest), loops matmul.s, matmul.s1, matmul.d
+div           S / scale                scale = sqrt(D) is a kernel scalar
+softmax_max   row max     [S,1]        init nest softmax_max.init.*, update `max=`
+softmax_neg   -max        [S,1]
+softmax_exp   exp(div + (-max))
+softmax_sum   row sum     [S,1]
+softmax       softmax_exp / softmax_sum
+matmul_1      softmax @ v              loops matmul_1.s, matmul_1.d, matmul_1.s1
+O             O[s,d] = matmul_1[s,d]
+```
+
+Extra primitives:
+
+| call | effect |
+|---|---|
+| `s.bound("S", hw.pmax)` | assume `S <= pmax` (the kernel asserts it). A symbolic extent can only be a partition dim if bounded |
+| `s.recip_divisor(stage)` | `a / b -> a * (1/b)`; needed for `div` (scalar) and `softmax` (row sum): the hardware cannot divide. Creates stage `softmax_sum_rcp` |
+| `s.stage_in(t, None, SBUF, name)` | `at=None` stages at the kernel root (just before the first reader); also works for intermediates already in SBUF |
+| `s.stage_transposed(t, name, at=None)` | `t` (in SBUF) -> transposed tile `name` in SBUF via PSUM; what a matmul needs when the contraction axis is the free axis (use for `q_sb`, `k_sb`, `softmax`) |
+| `s.stage_out(t, None, SBUF, name)` | `at=None` allowed |
+| `s.replace(loop, instr)` | instrs: `ns.tensor.matmul` (k,m,n loops), `ns.vector.scale` (`x*c`), `ns.vector.reduce_max` / `reduce_sum` (row reduction; also consumes the init nest), `ns.vector.negate`, `ns.vector.reciprocal`, `ns.vector.scale_rows` (`x * vec[i,0]`), `ns.scalar.exp_bias` (`exp(x + bias[i,0])`). Operands must be in SBUF/PSUM; `matmul` stationary/moving in SBUF, dst in PSUM |
+
+Worked example, `S, D <= pmax` (one tile per stage). For bigger `S` (multiple of pmax) split `O.s` by `hw.pmax`,
+`compute_at` the stages into that loop last-stage-first, chunk the key axis by `hw.pmax` (`div.s1`, `matmul_1.s1`):
+see `examples/attention.py` `tiled`.
+
+```python
+def schedule(s, hw):
+    s.bound("S", hw.pmax); s.bound("D", hw.pmax)
+    s.recip_divisor("div"); s.recip_divisor("softmax")
+    for buf in ("div", "softmax_max", "softmax_neg", "softmax_exp", "softmax_sum", "softmax_sum_rcp", "softmax"):
+        s.set_memory(buf, SBUF)
+    s.set_memory("matmul", PSUM); s.set_memory("matmul_1", PSUM)
+    for t in ("q", "k", "v"):
+        s.stage_in(t, None, SBUF, f"{t}_sb")
+    s.stage_transposed("q_sb", "qT"); s.stage_transposed("k_sb", "kT"); s.stage_transposed("softmax", "pT")
+    s.stage_out("O", None, SBUF, "O_sb")
+    s.replace("matmul.s", "ns.tensor.matmul"); s.fold_init("matmul")
+    s.replace("div.s", "ns.vector.scale")
+    s.replace("softmax_max.s", "ns.vector.reduce_max"); s.replace("softmax_neg.s", "ns.vector.negate")
+    s.replace("softmax_exp.s", "ns.scalar.exp_bias"); s.replace("softmax_sum.s", "ns.vector.reduce_sum")
+    s.replace("softmax_sum_rcp.d0", "ns.vector.reciprocal"); s.replace("softmax.s", "ns.vector.scale_rows")
+    s.replace("matmul_1.s", "ns.tensor.matmul"); s.fold_init("matmul_1")
+```
+
+Order matters: `set_memory` before `stage_transposed("softmax", ...)` (the source must be in SBUF) and before `replace`;
+`stage_in`/`stage_transposed` before the `replace` of the nest that reads the tensor. A softmax that forgets to
+subtract the row max overflows on large scores: the checker uses such inputs, so do not drop `softmax_neg`/`exp_bias`.

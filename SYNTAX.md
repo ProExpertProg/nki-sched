@@ -1,6 +1,6 @@
 # nki-sched — schedule language draft (v0)
 
-Status: **partly implemented.** The tiled matmul (§1, §2 partly, §3 partly, §4.1, §4.2) runs end to end; the schedules shown are the real code in `examples/`. Sections or rows marked *(planned)* are design only: symbolic block factors, K-blocking, `multibuffer`/`pipeline`/`overlap`, `set_engine`, pattern cursors (`s.find`), `fold_partition`, `transpose_input`. In v0 a handle is just a unique loop/buffer name. Names are provisional. Items marked `[verify]` depend on NKI behaviour not yet confirmed (nki 0.6.0, see PLAN §3).
+Status: **partly implemented.** The tiled matmul (§1, §2 partly, §3 partly, §4.1, §4.2) and single-head attention (§4.3, `docs/ATTENTION.md`) run end to end; the schedules shown are the real code in `examples/`. Sections or rows marked *(planned)* are design only: symbolic block factors, K-blocking, `multibuffer`/`pipeline`/`overlap`, `set_engine`, pattern cursors (`s.find`), `fold_partition`, `transpose_input`. In v0 a handle is just a unique loop/buffer name. Names are provisional. Items marked `[verify]` depend on NKI behaviour not yet confirmed (nki 0.6.0, see PLAN §3).
 
 ## 0. Two program levels (and their names)
 
@@ -100,12 +100,14 @@ Every primitive: `(preconditions checked) → rewrite → (cursor forwarding fn)
 | `fission(loop, at=stmt)` / `fuse_stmts` | split/merge loop bodies | stmt-level commutativity |
 | `compute_at(stage, at=loop)` | Halide `f.compute_at(g, y)` / TVM `s[f].compute_at(s[g], ax)`: move the producer's loop nests from the root to *inside* the consumer loop `at`; each iteration computes only the region the consumer needs there (interval analysis), and by default its storage shrinks/moves with it | producer region ⊆ computed region (Halide bounds inference) |
 | `store_at(stage_or_buf, at=loop)` | allocation granularity | enclosing; live range covers uses |
-| `stage_in(tensor, at=loop, mem=, name=, window=None)` | cache_read: copy window of `tensor` into new buffer in `mem` before `loop` body; rewrite uses. **The staging copy is created directly as the right ns instruction** from (src mem → dst mem): HBM↔SBUF `ns.sync.dma_copy`, on-chip `ns.vector.tensor_copy`. A *compute* nest that happens to be a pure copy (the PSUM→SBUF cast-out) is recognised and converted at emission (`select_copies`) | window inferred (interval analysis) or checked ⊇ accesses; capacity check |
-| `stage_out(tensor, at=loop, mem=, name=)` | cache_write/write-back (same implicit instruction choice) | same; `accum=True` form = zero/accumulate/add-back (Exo `stage_mem(accum=)`) |
-| `set_memory(buf, HBM\|SBUF\|PSUM)` | memory space of an allocation | partition-dim rule (axis 0 ≤128 on SBUF/PSUM), PSUM ⇒ fp32 and ≤ bank size, accessed only by allowed instrs |
+| `stage_in(tensor, at=loop\|None, mem=, name=, perm=None)` | cache_read: copy window of `tensor` into new buffer in `mem` just before its first reader inside `loop` (or anywhere, for `at=None`, the kernel root); rewrite uses. `perm=(1, 0)` stages the transpose (SBUF → PSUM, `ns.tensor.transpose`). **The staging copy is created directly as the right ns instruction** from (src mem → dst mem): HBM↔SBUF `ns.sync.dma_copy`, on-chip `ns.vector.tensor_copy`. A *compute* nest that happens to be a pure copy (the PSUM→SBUF cast-out) is recognised and converted at emission (`select_copies`) | window inferred (interval analysis) or checked ⊇ accesses; capacity check |
+| `stage_out(tensor, at=loop\|None, mem=, name=)` | cache_write/write-back (same implicit instruction choice) | same; `accum=True` form = zero/accumulate/add-back (Exo `stage_mem(accum=)`) |
+| `set_memory(buf, HBM\|SBUF\|PSUM)` | memory space of an allocation | partition-dim rule (axis 0 ≤ pmax on SBUF/PSUM, *proved* from the program's `bound`s when symbolic), PSUM free size ≤ one bank; per instruction: matmul writes f32, a transpose keeps its input dtype, operands in the memories the instruction allows |
 | `expand_dim(buf, size, idx)` / `lift_alloc` / `sink_alloc` | give a buffer a leading rotating dim; move alloc | indexing in bounds |
 | `fold_init(stage)` | drop the zero-init nest; first matmul overwrites (`accumulate=None`) | init is a full-tile store of 0 immediately preceding the accumulate nest, target in PSUM |
-| `replace(block, instr)` | **tensorize**: match block against instr's semantic body by unification; emit instr call | unifier succeeds ⇒ equivalence by construction |
+| `replace(loop, instr)` | **tensorize**: match the nest against the instruction's semantic pattern (`instrs.INSTRS`); emit the call. A reduction instruction also consumes the init nest in front of it | unifier succeeds ⇒ equivalence by construction; the interpreter's handler is tested against the same pattern |
+| `bound(size, max)` | assume `size <= max` (the kernel asserts it); lets a symbolic extent be a legal partition dim | size symbol of the program |
+| `recip_divisor(stage)` | rewrite `a / b` as `a * (1/b)` (hardware multiplies by a scalar/row vector but cannot divide by one); the reciprocal is computed once | `b` is a buffer element or a kernel scalar; **not bit-exact**, recorded in `Sched.notes` |
 | `mark(loop, AFFINE\|SEQUENTIAL\|STATIC)` | **optional assertion/override.** Loop kind is *inferred* from the dependence analysis at emission (→ `nl.affine_range / sequential_range / static_range`); `mark` checks an expectation (error if the analysis disagrees) or forces a more conservative kind | AFFINE: no loop-carried dep other than PSUM-accumulate reduction; STATIC ⇒ unroll |
 
 ### Derived (library, built on the core)
@@ -118,6 +120,7 @@ Every primitive: `(preconditions checked) → rewrite → (cursor forwarding fn)
 | `pipeline(loop, stages=[[...],[...]], lag=1)` | `fission` + `shift_loop` + peel prologue/epilogue + `multibuffer` | software pipelining; legality = WAR/RAW distance < depth |
 | `overlap(stmtA, stmtB)` | `reorder_stmts` + engine annotation | assert independent & on different engines/queues, interleave in program order |
 | `set_engine(stmt, ns.vector\|ns.scalar\|ns.gpsimd)` | move a statement whose instruction exists on several engines (e.g. `tensor_copy`) | instr must be legal on that engine; verified in 0.6.0: `tensor_copy`/`dma_copy` accept `engine=`, `activation` does not (fixed engine) |
+| `stage_transposed(tensor, name, at=None)` | `stage_in(perm=(1, 0))` into PSUM, then copy to SBUF | the layout a matmul wants (`[k, m]`, contraction on the partition axis) from a `[m, k]` SBUF tile |
 | `transpose_input(arg, via="dma"\|"pe")` | insert layout stage | `A[M,K] → lhsT[K,M]` (`nisa.dma_transpose` / `nisa.nc_transpose` exist in 0.6.0) |
 
 ---
@@ -204,6 +207,29 @@ def l6(s, hw):                     # l7 is the same schedule
 
 **These are not general.** They keep whole operand strips in SBUF, so they only work while K·M and K·N fit on chip; the emitted kernel asserts a conservative footprint bound and fails loudly otherwise. They exist to exercise `hoist` and are not a blocking strategy. Real blocking needs symbolic block factors (`split` by `min(4, M//128)` so one file serves every shape) and K-blocking with several live PSUM tiles; neither is implemented.
 
+### 4.3 Attention (implemented: `examples/attention.py`, details in `docs/ATTENTION.md`)
+
+```python
+def single_tile(s, hw):                     # S, D <= pmax: every stage is one instruction on one tile
+    s.bound("S", hw.pmax); s.bound("D", hw.pmax)
+    s.recip_divisor("div"); s.recip_divisor("softmax")          # hardware cannot divide by a scalar / row vector
+    for buf in ("div", "softmax_max", "softmax_neg", "softmax_exp", "softmax_sum", "softmax_sum_rcp", "softmax"):
+        s.set_memory(buf, SBUF)
+    s.set_memory("matmul", PSUM); s.set_memory("matmul_1", PSUM)
+    for t in ("q", "k", "v"): s.stage_in(t, None, SBUF, f"{t}_sb")
+    s.stage_transposed("q_sb", "qT"); s.stage_transposed("k_sb", "kT"); s.stage_transposed("softmax", "pT")
+    s.stage_out("O", None, SBUF, "O_sb")
+    s.replace("matmul.s", "ns.tensor.matmul"); s.fold_init("matmul")
+    s.replace("div.s", "ns.vector.scale")                       # PSUM evacuation + 1/sqrt(D)
+    s.replace("softmax_max.s", "ns.vector.reduce_max"); s.replace("softmax_neg.s", "ns.vector.negate")
+    s.replace("softmax_exp.s", "ns.scalar.exp_bias");  s.replace("softmax_sum.s", "ns.vector.reduce_sum")
+    s.replace("softmax_sum_rcp.d0", "ns.vector.reciprocal"); s.replace("softmax.s", "ns.vector.scale_rows")
+    s.replace("matmul_1.s", "ns.tensor.matmul"); s.fold_init("matmul_1")
+```
+
+`tiled` does the same per 128-row query tile (`compute_at` the whole chain into the tile loop, scores in key chunks of
+128, the value matmul accumulating over key chunks in PSUM), for any `S % 128 == 0`. Both emit shape-generic kernels.
+
 ### 4.5 Beyond the ladder — overlap (device-measured, not in the simulator)
 
 ```python
@@ -249,14 +275,19 @@ ScheduleError in l6.check_capacity()
 
 ---
 
-## 6. Debug/inspection surface
+## 6. Debug/inspection surface (implemented)
 
 ```python
-k = nks.compile(prog, l7,                  # knobs default to functions of the shape
-               
-               check_each_step=True)      # after EVERY primitive: numpy-interpret IR vs torch eager on hostile inputs
-print(k.ir)                               # scheduled IR           print(k.history[3])  # IR after 4th primitive
-print(k.source)                           # emitted NKI python     k.schedule_log       # replayable primitive trace (JSON)
-k.stats()                                 # static: hbm bytes, flops, arithmetic intensity, SBUF/PSUM footprint
-k.verify_nkibench(level=7)                # runs nkibench check on the emitted file
+from nki_sched import Sched, verify
+
+check = verify.make_checker(oracle, shapes)        # numpy-interpret the program against a torch/numpy oracle ...
+s = Sched(proc, hw, check=check)                   # ... after EVERY primitive (and again with affine loops reversed)
+print(s.show())                                    # the current ns-level IR
+print(s.source())                                  # the emitted NKI kernel (every loop nest must be an instruction)
+s.loops("matmul")                                  # loop names of a stage's update nest, outermost first
+s.history                                          # [(label, proc)]: the program after each primitive
+s.notes                                            # caveats the schedule introduced: fp reassociation, recip_divisor
 ```
+
+`dma_bytes(proc, sizes)` (in `nki_sched.analysis`) gives the static HBM traffic of a scheduled program. The node-side
+checks (`scripts/kernel_check.py`, `scripts/device_check.sh`) are described in the README.

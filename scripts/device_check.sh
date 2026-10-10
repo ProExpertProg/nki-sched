@@ -1,40 +1,60 @@
 #!/bin/bash
-# Emit a ladder schedule, copy it to a Trainium node, and check it three ways:
-#   1. nkibench (rule scan + nki.simulate numerics + HBM traffic bar)
-#   2. nki.simulate with float32 + bfloat16 inputs
-#   3. compiled with neuronx-cc and executed on the NeuronCore (numerics only; wall time is launch-dominated)
+# Emit a schedule's kernel, copy it to a Trainium node and check it there, cheapest layer first:
 #
-#   ENV_FILE=/path/to/.env scripts/device_check.sh l5
+#   compile   neuronx-cc compile only (no core needed -- catches what the hardware compiler rejects and
+#             the simulator accepts; works while other jobs hold the NeuronCores)
+#   sim       nki.simulate against numpy (float32; matmul also bfloat16)
+#   nkibench  (matmul levels only) nkibench's rule scan, numerics and HBM-traffic bar
+#   hw        compile and run on a NeuronCore, compare with numpy (wall time is launch-dominated)
+#
+#   ENV_FILE=/path/to/.env scripts/device_check.sh l4          # matmul ladder: l4 l5 l6 l7
+#   ENV_FILE=/path/to/.env scripts/device_check.sh single_tile # attention: single_tile tiled
 #
 # Environment:
-#   ENV_FILE  file exporting AWS credentials     (default: $ROOT/../.env; pass it explicitly from a git worktree)
-#   POD       pod to use                         (default: seat-270)
+#   ENV_FILE      file exporting AWS credentials     (default: $ROOT/../.env; pass it explicitly from a git worktree)
+#   POD           pod to use                         (default: seat-270)
+#   PYTHON        interpreter with torch + numpy     (default: python3)
 #   NKIBENCH_DIR  directory holding nkibench.py on the node (default: /workspace/projects/02-kernel-agent)
-#   PYTHON    interpreter with torch + numpy     (default: python3)
-#   SKIP_HW=1 skip step 3
+#   SKIP_HW=1     skip the NeuronCore step (e.g. when the cores are held by another job)
+#
+# nkibench's attention level (8) is not run: its report code crashes on attention's case format
+# (KeyError: 'M'), so attention is checked by kernel_check.py instead.
 set -euo pipefail
-LEVEL_NAME=${1:?usage: device_check.sh l4|l5|l6|l7}
+WHAT=${1:?usage: device_check.sh l4|l5|l6|l7|single_tile|tiled}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 POD=${POD:-seat-270}
-NKIBENCH_DIR=${NKIBENCH_DIR:-/workspace/projects/02-kernel-agent}
 PYTHON=${PYTHON:-python3}
+NKIBENCH_DIR=${NKIBENCH_DIR:-/workspace/projects/02-kernel-agent}
 ENV_FILE=${ENV_FILE:-$ROOT/../.env}
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
-N=${LEVEL_NAME#l}
 TMP=$(mktemp -d)
-OUT=$TMP/kernel_$LEVEL_NAME.py
+OUT=$TMP/kernel_$WHAT.py
 NAME=$(basename "$OUT")
 
-"$PYTHON" "$ROOT/examples/matmul_ladder.py" "$LEVEL_NAME" "$OUT" >/dev/null
+case $WHAT in
+  l[4-7]) OP=matmul; SHAPES=""; DTYPES=f32,bf16
+          "$PYTHON" "$ROOT/examples/matmul_ladder.py" "$WHAT" "$OUT" >/dev/null ;;
+  single_tile|tiled) OP=attention; DTYPES=f32
+          # the tiled kernel needs S % 128 == 0; the single-tile one needs S, D <= 128
+          if [ "$WHAT" = tiled ]; then SHAPES="128x64,256x64,384x128,512x32"; else SHAPES="128x64,64x128,96x32,128x128"; fi
+          "$PYTHON" "$ROOT/examples/attention.py" "$WHAT" "$OUT" >/dev/null ;;
+  *) echo "unknown target $WHAT" >&2; exit 2 ;;
+esac
 ENTRY=$(grep -m1 '^def ' "$OUT" | sed 's/def \([a-zA-Z0-9_]*\).*/\1/')
+
 kubectl cp -c app "$OUT" "$POD:/tmp/$NAME"
-kubectl cp -c app "$ROOT/scripts/sim_dtypes.py" "$POD:/tmp/sim_dtypes.py"
-kubectl cp -c app "$ROOT/scripts/device_run.py" "$POD:/tmp/device_run.py"
-echo "== 1. nkibench level $N =="
-kubectl exec "$POD" -c app -- bash -c "cd $NKIBENCH_DIR && python nkibench.py --level $N --check /tmp/$NAME" | grep -E "rules|numerics|HBM traffic|VIOLATION|FAILED" | cut -c1-160
-echo "== 2. simulator, float32 + bfloat16 =="
-kubectl exec "$POD" -c app -- python /tmp/sim_dtypes.py "/tmp/$NAME" "$ENTRY"
+kubectl cp -c app "$ROOT/scripts/kernel_check.py" "$POD:/tmp/kernel_check.py"
+check() {  # mode
+  kubectl exec "$POD" -c app -- bash -c "cd /tmp && python /tmp/kernel_check.py /tmp/$NAME $ENTRY --op $OP --mode $1 --dtypes $DTYPES ${SHAPES:+--shapes $SHAPES}" 2>&1 | grep -v '^20[0-9][0-9]-'
+}
+
+echo "== compile only (neuronx-cc, no core) =="; check compile
+echo "== simulator =="; check sim
+if [ "$OP" = matmul ]; then
+  LEVEL=${WHAT#l}
+  echo "== nkibench level $LEVEL =="
+  kubectl exec "$POD" -c app -- bash -c "cd $NKIBENCH_DIR && python nkibench.py --level $LEVEL --check /tmp/$NAME" | grep -E "rules|numerics|HBM traffic|VIOLATION|FAILED" | cut -c1-160
+fi
 if [ -z "${SKIP_HW:-}" ]; then
-  echo "== 3. NeuronCore =="
-  kubectl exec "$POD" -c app -- bash -c "cd /tmp && NEURON_PLATFORM_TARGET_OVERRIDE=trn2 python /tmp/device_run.py /tmp/$NAME $ENTRY 2"
+  echo "== NeuronCore =="; check hw
 fi
