@@ -1,6 +1,6 @@
 # nki-sched — schedule language draft (v0)
 
-Status: **design draft, nothing here is implemented.** Names are provisional. Everything marked `[verify]` depends on an NKI capability that was not confirmed against the installed package (nki 0.6.0, see PLAN §3).
+Status: **partly implemented.** The matmul ladder (§4.1, §4.2 and the full-residency form of §4.3) runs end to end: the schedules below are the real code in `nki_sched/schedules.py`, checked after every primitive against eager torch and, for the emitted kernels, `nkibench` on `seat-270`. Sections or rows marked *(planned)* are still design only: symbolic block factors, K-blocking, `multibuffer`/`pipeline`/`overlap`, `set_engine`, pattern cursors (`s.find`), and `transpose_input`. In v0 a handle is just a unique loop/buffer name. Names are provisional. Items marked `[verify]` depend on NKI behaviour not yet confirmed (nki 0.6.0, see PLAN §3).
 
 ## 0. Two program levels (and their names)
 
@@ -109,7 +109,7 @@ Every primitive: `(preconditions checked) → rewrite → (cursor forwarding fn)
 | `fission(loop, at=stmt)` / `fuse_stmts` | split/merge loop bodies | stmt-level commutativity |
 | `compute_at(stage, at=loop)` | Halide `f.compute_at(g, y)` / TVM `s[f].compute_at(s[g], ax)`: move the producer's loop nests from the root to *inside* the consumer loop `at`; each iteration computes only the region the consumer needs there (interval analysis), and by default its storage shrinks/moves with it | producer region ⊆ computed region (Halide bounds inference) |
 | `store_at(stage_or_buf, at=loop)` | allocation granularity | enclosing; live range covers uses |
-| `stage_in(tensor, at=loop, mem=, name=, window=None)` | cache_read: copy window of `tensor` into new buffer in `mem` before `loop` body; rewrite uses. **The copy is created directly as the right ns instruction** from (src mem → dst mem): HBM→SBUF `ns.sync.dma_copy`, PSUM→SBUF `ns.vector.tensor_copy` (cast implied by dst dtype); no copy loop nest, no separate lowering step | window inferred (interval analysis) or checked ⊇ accesses; capacity check |
+| `stage_in(tensor, at=loop, mem=, name=, window=None)` | cache_read: copy window of `tensor` into new buffer in `mem` before `loop` body; rewrite uses. **The staging copy is created directly as the right ns instruction** from (src mem → dst mem): HBM↔SBUF `ns.sync.dma_copy`, on-chip `ns.vector.tensor_copy`. A *compute* nest that happens to be a pure copy (the PSUM→SBUF cast-out) is recognised and converted at emission (`select_copies`) | window inferred (interval analysis) or checked ⊇ accesses; capacity check |
 | `stage_out(tensor, at=loop, mem=, name=)` | cache_write/write-back (same implicit instruction choice) | same; `accum=True` form = zero/accumulate/add-back (Exo `stage_mem(accum=)`) |
 | `set_memory(buf, HBM\|SBUF\|PSUM)` | memory space of an allocation | partition-dim rule (axis 0 ≤128 on SBUF/PSUM), PSUM ⇒ fp32 and ≤ bank size, accessed only by allowed instrs |
 | `expand_dim(buf, size, idx)` / `lift_alloc` / `sink_alloc` | give a buffer a leading rotating dim; move alloc | indexing in bounds |
@@ -135,69 +135,107 @@ Every primitive: `(preconditions checked) → rewrite → (cursor forwarding fn)
 
 Each schedule is a Python function; constants (`BM`, `depth`…) are plain parameters, so a schedule is also a **tunable template** (TVM knobs).
 
-### 4.1 Level 4 — tiled matmul (must lower to `reference_level4.py`'s structure)
+### 4.1 Level 4 — tiled matmul (implemented; lowers to `reference_level4.py`'s structure)
 
 ```python
-@nks.schedule
-def l4(s: nks.Sched):
-    # tile the output; mi/ni match PE-array limits: 128 stationary-free, 512 moving-free
-    mo, mi = s.split("C.m", hw.GEMM_STATIONARY_FMAX)    # 128
-    no, ni = s.split("C.n", hw.GEMM_MOVING_FMAX)        # 512
+def l4(s, hw):
+    mo, mi = s.split("C.m", hw.stationary_fmax, names=("mo", "mi"), perfect=True)   # 128
+    no, ni = s.split("C.n", hw.moving_fmax, names=("no", "ni"), perfect=True)       # 512
     s.reorder(mo, no, mi, ni)
-
-    # one accumulator tile per output tile; bounds inferred: acc_t is [128,512]
-    s.compute_at("acc", at=no)
-
-    # contraction tiled by the partition size and made outermost in the update nest
-    ko, ki = s.split("acc.k", hw.PMAX)                  # 128
-    s.reorder(ko, ki, "acc.m", "acc.n")                 # legal: + is associative (reduction)
-
-    # memory spaces
-    s.set_memory("acc", PSUM)                           # f32, 128 partitions x 512 = one bank
-    s.stage_in("lhsT", at=ko, mem=SBUF, name="lhsT_sb") # window inferred [ko*128:+128, mo*128:+128]
-    s.stage_in("rhs",  at=ko, mem=SBUF, name="rhs_sb")  # window inferred [ko*128:+128, no*512:+512]
-    s.stage_out("C",   at=no, mem=SBUF, name="C_sb")    # cast-out staging, then DMA to HBM
-
-    # instruction selection
-    s.fold_init("acc")
-    s.replace(s.find("for ki in _: _"), ns.tensor.matmul)   # k=partition, m=stationary free, n=moving free
-
+    s.compute_at("acc", at=no)              # acc tile computed per output tile; region inferred: [128, 512]
+    ko, ki = s.split("acc.k", hw.pmax, names=("ko", "ki"), perfect=True)            # 128
+    s.reorder(ko, ki, "acc.m", "acc.n")     # legal: + is associative (reduction rule)
+    s.set_memory("acc", PSUM)               # f32, 128 partitions x 512 = one bank
+    s.stage_in("lhsT", at=ko, mem=SBUF, name="lhsT_sb")   # window inferred [ko*128:+128, mo*128:+128]
+    s.stage_in("rhs",  at=ko, mem=SBUF, name="rhs_sb")    # window inferred [ko*128:+128, no*512:+512]
+    s.stage_out("C",   at=no, mem=SBUF, name="C_sb")      # cast-out staging, then DMA to HBM
+    s.replace(ki, "ns.tensor.matmul")       # k=partition, m=stationary free, n=moving free
+    s.fold_init("acc")                      # first matmul into the fresh PSUM tile overwrites
+    # The cast-out nest C_sb[mi,ni] = cast(acc[mi,ni]) is recognised as a pure copy at emission and
+    # becomes ns.vector.tensor_copy (implicit instruction selection for copies).
 ```
 
-ns-level IR after the schedule (what `print(s.ir)` shows — and what the emitter consumes):
+`perfect=True` records the assumption `M % 128 == 0` (etc.); the emitted kernel asserts it. Extents stay symbolic (`M`, `N`, `K`), so one emitted file serves every shape, like `reference_level4.py`.
+
+ns-level IR after the schedule (`print(s.show())`, before emission turns the cast-out nest into `ns.vector.tensor_copy`):
 
 ```
-alloc C : bf16[M,N] @ HBM                              # kernel output (nl.shared_hbm)
-for mo in affine(M/128):
-  for no in affine(N/512):
-    alloc acc : f32[128,512] @ PSUM
-    for ko in affine(K/128):
-      alloc lhsT_sb : bf16[128,128] @ SBUF
-      alloc rhs_sb  : bf16[128,512] @ SBUF
-      ns.sync.dma_copy(lhsT_sb, lhsT[ko*128:+128, mo*128:+128])
-      ns.sync.dma_copy(rhs_sb,  rhs [ko*128:+128, no*512:+512])
-      ns.tensor.matmul(dst=acc, stationary=lhsT_sb, moving=rhs_sb)      # accumulate=None
-    alloc C_sb : bf16[128,512] @ SBUF
-    ns.vector.tensor_copy(C_sb, acc)                                 # PSUM→SBUF + cast
-    ns.sync.dma_copy(C[mo*128:+128, no*512:+512], C_sb)
+  for mo in 0..(M // 128):
+    for no in 0..(N // 512):
+      alloc C_sb : like:lhsT[128, 512] @ SBUF
+      alloc acc : f32[128, 512] @ PSUM
+      for ko in 0..(K // 128):
+        alloc rhs_sb : like:rhs[128, 512] @ SBUF
+        ns.sync.dma_copy(dst=rhs_sb[0:+128, 0:+512], src=rhs[128*ko:+128, 512*no:+512])
+        alloc lhsT_sb : like:lhsT[128, 128] @ SBUF
+        ns.sync.dma_copy(dst=lhsT_sb[0:+128, 0:+128], src=lhsT[128*ko:+128, 128*mo:+128])
+        ns.tensor.matmul(dst=acc[0:+128, 0:+512], stationary=lhsT_sb[0:+128, 0:+128], moving=rhs_sb[0:+128, 0:+512], accumulate=None)
+      for mi in 0..128:
+        for ni in 0..512:
+          C_sb[mi, ni] = cast_like:lhsT(acc[mi, ni])
+      ns.sync.dma_copy(dst=C[128*mo:+128, 512*no:+512], src=C_sb[0:+128, 0:+512])
 ```
 
-The emitter lowers each `ns.<engine>.<inst>` to its NKI form (`ns.tensor.matmul` → `nisa.nc_matmul`, `ns.vector.tensor_copy` → `nisa.tensor_copy(..., engine=nisa.vector_engine)`, `ns.sync.dma_copy` → `nisa.dma_copy`). Emitted Python is the same shape as `reference_level4.py` (`nl.affine_range`, `nl.ndarray(..., buffer=nl.psum)`, `nisa.dma_copy(dst=, src=)`, `nisa.nc_matmul(dst=, stationary=, moving=)`, `nisa.tensor_copy`). **Acceptance test #1 is that this passes `nkibench.py --level 4 --check` and models ≈2.0× the HBM byte floor.**
+The emitter lowers each `ns.<engine>.<inst>` to its NKI form (`ns.tensor.matmul` → `nisa.nc_matmul`, `ns.vector.tensor_copy` → `nisa.tensor_copy`, `ns.sync.dma_copy` → `nisa.dma_copy`; `engine=` is only emitted after an explicit `set_engine`). **Measured on `seat-270` (nki.simulate): passes `nkibench --level 4 --check`, traffic 1.00 / 1.56 / 1.00 / 2.00× the floor on the four shapes.**
 
-### 4.2 Level 5 — hoist the big operand's loads out of the loop that doesn't index it (bar: ≤1.6× floor)
+### 4.2 Level 5 — hoist the big operand's loads out of the loop that doesn't index it (implemented; bar ≤1.6×)
 
-Hoisting a load out of `ko` alone saves nothing (each tile is still read once per output tile — L4 already does that). The saving comes from hoisting across `mo`/`no`: `rhs[:, no-strip]` does not depend on `mo`, so with `no` outermost it is loaded once per `no` instead of once per `(mo,no)`. `rhs` is the larger operand, so hoist that one (hoisting only `lhsT` strips gives 1.86× — fails the bar; see table).
+Hoisting a load out of `ko` alone saves nothing (each tile is still read once per output tile — L4 already does that). The saving comes from hoisting across `mo`/`no`: `rhs[:, no-strip]` does not depend on `mo`, so with `no` outermost it is loaded once per `no`. `rhs` is the larger operand, so hoist that one (hoisting only `lhsT` strips gives 1.86× — fails the bar; see table).
 
 ```python
-@nks.schedule
-def l5(s):
-    l4(s)
-    s.reorder("no", "mo")                  # independent output-tile loops: any order is legal
-    s.hoist("rhs_sb", to="no")             # window grows [128,512] -> [K,512] (interval analysis over ko, mo)
-    s.fold_partition("rhs_sb", dim=0)      # K>128 can't live on the partition axis: buffer is [128, K/128, 512]
+def l5(s, hw):
+    l4(s, hw)
+    s.reorder("no", "mo")          # independent output-tile loops: any order is legal
+    s.hoist("rhs_sb", to="no")     # the fill moves to `no`; the buffer grows along ko over the partition axis
 ```
 
-### 4.3 Level 6/7 — block M, N (and K) with several PSUM tiles live
+`hoist` folds the grown K axis into a new axis 1 (`[128, K/128, 512]`, K>128 can't live on the partition axis); the matmul reads `rhs_sb[0:128, ko, 0:512]` (an integer-indexed axis, "point"). IR:
+
+```
+  for no in 0..(N // 512):
+    alloc rhs_sb : like:rhs[128, (K // 128), 512] @ SBUF
+    for rhs_sb_ko_ld in 0..(K // 128):
+      ns.sync.dma_copy(dst=rhs_sb[0:+128, rhs_sb_ko_ld, 0:+512], src=rhs[128*rhs_sb_ko_ld:+128, 512*no:+512])
+    for mo in 0..(M // 128):
+      alloc C_sb : like:lhsT[128, 512] @ SBUF
+      alloc acc : f32[128, 512] @ PSUM
+      for ko in 0..(K // 128):
+        alloc lhsT_sb : like:lhsT[128, 128] @ SBUF
+        ns.sync.dma_copy(dst=lhsT_sb[0:+128, 0:+128], src=lhsT[128*ko:+128, 128*mo:+128])
+        ns.tensor.matmul(dst=acc[0:+128, 0:+512], stationary=lhsT_sb[0:+128, 0:+128], moving=rhs_sb[0:+128, ko, 0:+512], accumulate=None)
+      for mi in 0..128:
+        for ni in 0..512:
+          C_sb[mi, ni] = cast_like:lhsT(acc[mi, ni])
+      ns.sync.dma_copy(dst=C[128*mo:+128, 512*no:+512], src=C_sb[0:+128, 0:+512])
+```
+
+**Measured: passes `nkibench --level 5`; traffic 1.00 / 1.11 / 1.00 / 1.14× — exactly the analytic prediction below.**
+
+### 4.3 Level 6/7 — implemented as *full residency*; symbolic blocking is *(planned)*
+
+**What exists (`l6` = `l7`):** on top of `l5`, `s.hoist("lhsT_sb", to=None)` puts the whole `lhsT` in SBUF at the top of the kernel, so every operand is read exactly once (byte floor). There are no block loops; the SBUF footprint grows with K·M, and the emitted kernel `assert`s a conservative footprint bound against the SBUF budget (`[unverified]` 192 KiB/partition). **Measured: passes `nkibench --level 6` and `--level 7`, traffic 1.00× on all four shapes.** This meets the traffic bars but is *not* the tutorial's blocked structure and does not scale past SBUF capacity.
+
+```
+  alloc lhsT_sb : like:lhsT[128, (K // 128), 128*(M // 128)] @ SBUF
+  for lhsT_sb_ko_ld in 0..(K // 128):
+    for lhsT_sb_mo_ld in 0..(M // 128):
+      ns.sync.dma_copy(dst=lhsT_sb[0:+128, lhsT_sb_ko_ld, 128*lhsT_sb_mo_ld:+128], src=lhsT[128*lhsT_sb_ko_ld:+128, 128*lhsT_sb_mo_ld:+128])
+  for no in 0..(N // 512):
+    alloc rhs_sb : like:rhs[128, (K // 128), 512] @ SBUF
+    for rhs_sb_ko_ld in 0..(K // 128):
+      ns.sync.dma_copy(dst=rhs_sb[0:+128, rhs_sb_ko_ld, 0:+512], src=rhs[128*rhs_sb_ko_ld:+128, 512*no:+512])
+    for mo in 0..(M // 128):
+      alloc C_sb : like:lhsT[128, 512] @ SBUF
+      alloc acc : f32[128, 512] @ PSUM
+      for ko in 0..(K // 128):
+        ns.tensor.matmul(dst=acc[0:+128, 0:+512], stationary=lhsT_sb[0:+128, ko, 128*mo:+128], moving=rhs_sb[0:+128, ko, 0:+512], accumulate=None)
+      for mi in 0..128:
+        for ni in 0..512:
+          C_sb[mi, ni] = cast_like:lhsT(acc[mi, ni])
+      ns.sync.dma_copy(dst=C[128*mo:+128, 512*no:+512], src=C_sb[0:+128, 0:+512])
+```
+
+**What is still design (*planned*):** real blocking needs symbolic block factors (`BM = min(4, M//128)`, so one file serves all shapes), i.e. `split` with a non-integer factor, and K-blocking with several PSUM tiles live. The sketch below is that design:
 
 This is a *re-placement*, not a reorder of the L4 nest: the accumulator is computed per **block** of `BM×BN` output tiles, and `acc`'s own loops are re-tiled with `kb` outermost. Everything is expressed with `split` + `compute_at` + `reorder` on loops that are perfect nests at that point (init is its own nest, so there is nothing between the loops).
 
@@ -228,9 +266,9 @@ def l7(s, BM=None, BN=None, BK=None):
 
 `l6` is the same schedule with `BK = K//128` (a single `kb` iteration — no K blocking). `l4` ≡ `BM=BN=1`, one `kb` per `ko`.
 
-### 4.3.1 Predicted HBM traffic (static analysis; not yet run through nkibench)
+### 4.3.1 HBM traffic: analytic model, confirmed on the simulator for l4 / l5 / l6 / l7
 
-Computed with the same accounting as `nkibench` (bytes moved by `dma_copy`, loads + the output store, against a floor of inputs + output), analytically from the schedule's staging windows. The model reproduces the L4 "2.0×" figure nkibench quotes for K=256, M=512, N=1024 — the sanity check that the accounting matches. Shapes are the four in `_MM_SHAPES`, ordered (K,M,N) = (128,128,512), (256,256,1024), (512,128,512), (256,512,1024):
+Computed with the same accounting as `nkibench` (bytes moved by `dma_copy`, loads + the output store, against a floor of inputs + output), analytically from the schedule's staging windows. The model reproduces the L4 "2.0×" figure nkibench quotes for K=256, M=512, N=1024, and the simulator runs below agree with every row that was run (l4: 1.00 1.56 1.00 2.00; l5: 1.00 1.11 1.00 1.14; l6/l7: 1.00 on all four). Shapes are the four in `_MM_SHAPES`, ordered (K,M,N) = (128,128,512), (256,256,1024), (512,128,512), (256,512,1024):
 
 | schedule | knobs | ratio vs floor on the 4 shapes | worst | bar |
 |---|---|---|---|---|

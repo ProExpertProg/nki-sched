@@ -1,6 +1,6 @@
 # nki-sched — a scheduling language on top of NKI
 
-**Status: plan only. No implementation code exists yet.**
+**Status: M0–M3 implemented for matmul (see §13); M4+ (multibuffer / pipeline / overlap, blocking, attention) is still plan.**
 Companion docs: [`SYNTAX.md`](SYNTAX.md) (language draft with worked schedules), [`docs/PRIOR_ART.md`](docs/PRIOR_ART.md) (what was read, what we take from each).
 
 ---
@@ -264,3 +264,34 @@ Multiple stages with producer–consumer placement (`compute_at` generalises bey
 5. **Interval analysis too coarse** for tails/modular indices ⇒ restrict v0 to divisible shapes + `cut`.
 6. **Scope creep to a general compiler**. Guardrail: ops added only when a ladder rung or attention needs them.
 7. **Open question for the user**: is `lhsT`-in-the-spec acceptable for v0 (my default), or should `A[M,K]` + automatic transpose be in the first milestone? Also: Python-source emission only, or also keep an option for `nki.baremetal`/`neuron-profile` integration inside the tool (my default: later, as a thin wrapper around what `nkibench` layers 2–3 will do).
+
+
+---
+
+## 13. Implementation status (what is built, what was verified, what was not)
+
+Code: `nki_sched/` (expr, ir, hw, interp, frontend, analysis, lower, sched, emit, verify, schedules), `tests/`, `examples/matmul_ladder.py`, `scripts/device_check.sh`.
+
+| Milestone | State | Notes |
+|---|---|---|
+| M0 skeleton, interpreter, torch trace, naive IR | **done** | `HardwareConfig` values other than tile caps are still `[unverified]` defaults — no probe script yet |
+| M1 core loop prims + differential testing | **done, simplified** | v0 handles are unique names (no cursors/forwarding, no `s.find` patterns); `split` supports only `perfect` (assumption → emitted assert), no `cut`/`guard`; no `fuse`/`unroll`; no property-based fuzzing yet |
+| M2 compute_at, staging, memory, replace, emitter | **done** | structural `replace` for matmul/copies (no general unification); interval analysis only; A4 passes |
+| M3 hoist, partition fold, traffic | **partly** | `hoist` (incl. to kernel root) done; A5 passes; A6/A7 *traffic bars* met by full residency, **not** by blocking (needs symbolic factors / K-blocking) |
+| M4 multibuffer / pipeline / overlap / set_engine | not started | no sync API in NKI 0.6.0 (verified) → these are reorderings + buffer rotation |
+| M5 device latency | not started | everything so far ran in `nki.simulate`, not on the NeuronCore |
+| M6 attention | not started | |
+
+**Acceptance tests that actually ran** (all with kernels emitted by the schedules, on `seat-270`, `nki.simulate`; none on real hardware):
+
+| test | result |
+|---|---|
+| `nkibench --level 4 --check` | rules clean, numerics 4/4, traffic 1.00 / 1.56 / 1.00 / 2.00× |
+| `nkibench --level 5 --check` | numerics 4/4, traffic 1.00 / 1.11 / 1.00 / 1.14× (bar 1.6×) |
+| `nkibench --level 6 --check` | numerics 4/4, traffic 1.00× ×4 (bar 1.25×) |
+| `nkibench --level 7 --check` | numerics 4/4, traffic 1.00× ×4 (bar 1.05×) |
+| `scripts/sim_dtypes.py` (float32 + bfloat16 inputs, all four shapes) | all four kernels OK (bf16 max error ≈ 3.8e-3 = output rounding) |
+
+Local tests (`pytest tests/`, 26): interpreter vs numpy, hand-built golden IR, emitted-source and `nkibench.check_rules` checks, every primitive including negative cases (error messages), per-step oracle checking of the whole l4/l5/l6 schedules on tiny tiles, a deliberately wrong rewrite being caught, torch trace round-trips, bf16 vs torch bf16.
+
+**Deviations from the plan as written:** (1) handles are names, not cursors; (2) copy instruction selection for compute nests happens at emission, while `stage_*` creates its copies directly; (3) levels 6/7 use full residency; (4) `engine=` is never emitted unless `set_engine` is called (not implemented yet) — NKI 0.6.0 does accept `engine=` on `tensor_copy`/`dma_copy` (verified), but `activation` has no such argument.
