@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from . import ir
-from .analysis import AnalysisError, injective, loop_ranges
+from .analysis import AnalysisError, dim_interval, loop_ranges
 from .expr import Aff, Var
 from .hw import DTYPE_BYTES, INSTRS, HardwareConfig
 
@@ -156,11 +156,24 @@ def infer_kinds(proc: ir.Proc) -> ir.Proc:
     kinds set via mark() are kept (and were already checked against this analysis)."""
     bufs = ir.buffers_of(proc)
 
-    def window_private(w: ir.Window, var: str) -> bool:
-        """different iterations of `var` write disjoint windows (stride >= window size in some dim)"""
-        for l, z in zip(w.lo, w.size):
+    def private(loc, var: str, inner: dict) -> bool:
+        """Do different iterations of `var` write disjoint regions? The region one iteration writes
+        is the access swept over the loops *inside* `var`; it is private if, in some dimension, the
+        stride of `var` is at least that region's extent (so the regions cannot overlap)."""
+        if isinstance(loc, ir.Window):
+            pairs = list(zip(loc.lo, loc.size))
+        else:
+            pairs = [(e, Aff(1)) for e in loc]
+        for l, z in pairs:
             c = l.coef(var)
-            if c and z.is_const and abs(c) >= z.const and not (l.free_vars() - {var} and False):
+            if not c:
+                continue
+            try:
+                _, span = dim_interval(l, inner)
+            except AnalysisError:
+                continue
+            region_size = span + z - 1
+            if region_size.is_const and abs(c) >= region_size.const:
                 return True
         return False
 
@@ -168,26 +181,26 @@ def infer_kinds(proc: ir.Proc) -> ir.Proc:
         if loop.kind != "auto":
             return loop.kind
         inner_allocs = {s.buf.name for s in ir.walk(loop.body) if isinstance(s, ir.Alloc)}
-        ranges = {loop.var: loop.extent}
+        inner = loop_ranges(loop.body)
         written = {}
         for s in ir.walk(loop.body):
+            if isinstance(s, ir.For):
+                continue
             for mode, buf, loc in ir.accesses(s):
                 if "w" in mode and buf not in inner_allocs:
                     written.setdefault(buf, []).append((s, loc))
         for buf, ws in written.items():
             for s, loc in ws:
-                if isinstance(loc, ir.Window):
-                    if isinstance(s, ir.Call) and s.instr == "ns.tensor.matmul" and s.attr("accumulate") is None \
-                            and not any(loop.var in e.free_vars() for e in loc.lo):
-                        continue  # PSUM accumulation across this loop (reduction)
-                    if not window_private(loc, loop.var):
-                        return "sequential"
-                else:
-                    if not any(loop.var in e.free_vars() for e in loc) or not injective(tuple(loc), ranges):
-                        return "sequential"
+                if isinstance(s, ir.Call) and s.instr == "ns.tensor.matmul" and s.attr("accumulate") is None \
+                        and isinstance(loc, ir.Window) and not any(loop.var in e.free_vars() for e in loc.lo):
+                    continue  # PSUM accumulation across this loop (reduction)
+                if not private(loc, loop.var, inner):
+                    return "sequential"
             # reads of a buffer written in the loop must hit what the same iteration wrote
             wlocs = [(l.lo, l.size) if isinstance(l, ir.Window) else tuple(l) for _, l in ws]
             for s in ir.walk(loop.body):
+                if isinstance(s, ir.For):
+                    continue
                 for mode, b2, loc in ir.accesses(s):
                     if b2 == buf and mode == "r":
                         key = (loc.lo, loc.size) if isinstance(loc, ir.Window) else tuple(loc)

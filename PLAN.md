@@ -279,10 +279,10 @@ Code: `nki_sched/` (expr, ir, hw, interp, frontend, analysis, lower, sched, emit
 | M2 compute_at, staging, memory, replace, emitter | **done** | structural `replace` for matmul/copies (no general unification); interval analysis only; A4 passes |
 | M3 hoist, partition fold, traffic | **partly** | `hoist` (incl. to kernel root) done; A5 passes; A6/A7 *traffic bars* met by full residency, **not** by blocking (needs symbolic factors / K-blocking) |
 | M4 multibuffer / pipeline / overlap / set_engine | not started | no sync API in NKI 0.6.0 (verified) → these are reorderings + buffer rotation |
-| M5 device latency | not started | everything so far ran in `nki.simulate`, not on the NeuronCore |
+| M5 device latency | correctness done, latency not | kernels run correctly on the NeuronCore; performance not measured (no profiler path used yet) |
 | M6 attention | not started | |
 
-**Acceptance tests that actually ran** (all with kernels emitted by the schedules, on `seat-270`, `nki.simulate`; none on real hardware):
+**Acceptance tests that actually ran** (all with kernels emitted by the schedules, on `seat-270`):
 
 | test | result |
 |---|---|
@@ -290,8 +290,13 @@ Code: `nki_sched/` (expr, ir, hw, interp, frontend, analysis, lower, sched, emit
 | `nkibench --level 5 --check` | numerics 4/4, traffic 1.00 / 1.11 / 1.00 / 1.14× (bar 1.6×) |
 | `nkibench --level 6 --check` | numerics 4/4, traffic 1.00× ×4 (bar 1.25×) |
 | `nkibench --level 7 --check` | numerics 4/4, traffic 1.00× ×4 (bar 1.05×) |
-| `scripts/sim_dtypes.py` (float32 + bfloat16 inputs, all four shapes) | all four kernels OK (bf16 max error ≈ 3.8e-3 = output rounding) |
+| `scripts/sim_dtypes.py` — `nki.simulate`, float32 + bfloat16 inputs, all four shapes | all four kernels OK (bf16 max error ≈ 3.8e-3 = output rounding) |
+| `scripts/device_run.py` — **compiled with neuronx-cc and executed on the NeuronCore** (`nki.jit` with numpy args), float32 + bfloat16, all four shapes | all four kernels correct (fp32 err ≤ 2.0e-5, bf16 ≤ 3.8e-3, identical to the repo's own `reference_level4.py` on the same inputs) |
 
-Local tests (`pytest tests/`, 26): interpreter vs numpy, hand-built golden IR, emitted-source and `nkibench.check_rules` checks, every primitive including negative cases (error messages), per-step oracle checking of the whole l4/l5/l6 schedules on tiny tiles, a deliberately wrong rewrite being caught, torch trace round-trips, bf16 vs torch bf16.
+Hardware caveat: the wall time per call is ≈1.6 s for every kernel and shape (launch/load overhead dominates), so **no performance conclusion has been drawn** — only correctness of the compiled kernels, including the 3-D SBUF tiles with shape-dependent free dims and the integer-indexed matmul operand (`rhs_sb[0:128, ko, 0:512]`) used by l5–l7. Latency needs the profiler (M5). `scripts/device_check.sh lN` runs all three layers for one schedule.
+
+Local tests (`pytest tests/`, 29): interpreter vs numpy, hand-built golden IR, emitted-source and `nkibench.check_rules` checks, every primitive including negative cases (error messages), per-step oracle checking of the whole l4/l5/l6 schedules on tiny tiles, a deliberately wrong rewrite being caught, torch trace round-trips, bf16 vs torch bf16; loop-kind soundness (a sweep like `x[i+j]` must not be inferred `affine`, `mark(affine)` on it fails, and a hand-forced affine recurrence is exposed by running affine loops in reverse). **Every per-step oracle check also re-runs the program with all affine loops iterated in reverse**, so the inferred `affine` annotations are tested rather than trusted (the interpreter otherwise ignores loop kinds).
+
+**Known soundness limits:** `perfect` splits are guarded only by an emitted assert; the dependence analysis is conservative but covers only the access shapes the ladder produces (affine boxes); fp reassociation is recorded in `Sched.notes` but not gated by a tolerance.
 
 **Deviations from the plan as written:** (1) handles are names, not cursors; (2) copy instruction selection for compute nests happens at emission, while `stage_*` creates its copies directly; (3) levels 6/7 use full residency; (4) `engine=` is never emitted unless `set_engine` is called (not implemented yet) — NKI 0.6.0 does accept `engine=` on `tensor_copy`/`dma_copy` (verified), but `activation` has no such argument.

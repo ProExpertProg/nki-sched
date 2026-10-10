@@ -6,6 +6,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import interp, ir
+from .lower import infer_kinds
 
 
 class Mismatch(Exception):
@@ -13,7 +14,7 @@ class Mismatch(Exception):
 
 
 def hostile_inputs(shapes_by_arg: dict, seed=0, dtype="f32"):
-    """Random inputs plus the usual hostile cases (zeros, one large-magnitude row/col)."""
+    """Random inputs plus the usual hostile cases (a large-magnitude element)."""
     r = np.random.default_rng(seed)
     out = {}
     for name, shp in shapes_by_arg.items():
@@ -43,18 +44,30 @@ def torch_oracle(fn):
     return run
 
 
-def make_checker(oracle, shapes, out="C", rtol=1e-4, atol=1e-4, dtype="f32", seeds=(0, 1)):
-    """shapes: list of dicts {"K":..,"M":..,"N":..}. Raises Mismatch with a locating message."""
+def _compare(got, want, rtol, atol, shp, reverse):
+    if got.shape != want.shape or not np.allclose(got, want, rtol=rtol, atol=atol):
+        bad = np.argwhere(~np.isclose(got, want, rtol=rtol, atol=atol)) if got.shape == want.shape else []
+        where = tuple(bad[0]) if len(bad) else None
+        tag = " (affine loops run in reverse)" if reverse else ""
+        raise Mismatch(f"shape {shp}{tag}: first mismatch at {where}: "
+                       f"got {got[where] if where else got.shape}, want {want[where] if where else want.shape}")
+
+
+def make_checker(oracle, shapes, out="C", rtol=1e-4, atol=1e-4, dtype="f32", seeds=(0, 1), reverse_affine=True):
+    """shapes: list of dicts {"K":..,"M":..,"N":..}. Raises Mismatch with a locating message.
+
+    With reverse_affine the program is run a second time with every (inferred or marked) affine loop
+    iterated in reverse order: an affine annotation on a loop that actually carries a dependence then
+    fails the oracle, so the loop-kind analysis is itself tested, not trusted."""
 
     def check(proc: ir.Proc):
         for shp in shapes:
             for seed in seeds:
                 inputs = hostile_inputs({"lhsT": (shp["K"], shp["M"]), "rhs": (shp["K"], shp["N"])}, seed, dtype)
-                got = interp.run(proc, inputs)[out]
                 want = oracle(inputs)
-                if got.shape != want.shape or not np.allclose(got, want, rtol=rtol, atol=atol):
-                    bad = np.argwhere(~np.isclose(got, want, rtol=rtol, atol=atol)) if got.shape == want.shape else []
-                    where = tuple(bad[0]) if len(bad) else None
-                    raise Mismatch(f"shape {shp}: first mismatch at {where}: got {got[where] if where else got.shape}, want {want[where] if where else want.shape}")
+                runs = [(proc, False)] + ([(infer_kinds(proc), True)] if reverse_affine else [])
+                for prog, rev in runs:
+                    got = interp.run(prog, inputs, reverse_affine=rev)[out]
+                    _compare(got, want, rtol, atol, shp, rev)
 
     return check

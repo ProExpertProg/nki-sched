@@ -148,3 +148,42 @@ def test_l6_full_residency_checked_every_step():
     assert len(lb.shape) == 3 and lb.shape[0].const == 4  # [128, K/128, M]
     src = s.source()
     assert "assert" in src and "SBUF footprint" in src
+
+
+# ---------------------------------------------------------------- loop-kind inference soundness
+def _x_proc(body, n=4):
+    return ir.Proc("t", (ir.Buffer("x", (ir.Aff(n),), "f32", ir.HBM, "out"),), (), body)
+
+
+def test_overlapping_inner_sweep_is_not_private():
+    """x[i+j] with inner j in [0,2): iterations i and i+1 both write x[i+1] -> i must NOT be affine."""
+    from nki_sched.expr import var
+    i, j = var("i"), var("j")
+    body = (ir.For("i", ir.Aff(3), (ir.For("j", ir.Aff(2), (ir.Assign("x", (i + j,), ir.Lit(1.0)),)),)),)
+    inferred = ir.find_loop(__import__("nki_sched.lower", fromlist=["x"]).infer_kinds(_x_proc(body)).body, "i")
+    assert inferred.kind == "sequential"
+    s = Sched(_x_proc(body), TINY)
+    with pytest.raises(ScheduleError, match="carries a dependence"):
+        s.mark("i", "affine")
+
+
+def test_disjoint_inner_sweep_is_private():
+    from nki_sched.expr import var
+    i, j = var("i"), var("j")
+    body = (ir.For("i", ir.Aff(2), (ir.For("j", ir.Aff(2), (ir.Assign("x", (i * 2 + j,), ir.Lit(1.0)),)),)),)
+    from nki_sched.lower import infer_kinds
+    assert ir.find_loop(infer_kinds(_x_proc(body)).body, "i").kind == "affine"
+
+
+def test_reverse_order_run_exposes_a_wrongly_forced_affine_loop():
+    """A loop-carried recurrence marked affine by hand: running affine loops in reverse must differ
+    from (or fail against) the in-order result, which is how the oracle tests loop-kind claims."""
+    from nki_sched.expr import var
+    i = var("i")
+    seq = (ir.Assign("x", (ir.Aff(0),), ir.Lit(1.0)),
+           ir.For("i", ir.Aff(3), (ir.Assign("x", (i + 1,), ir.Mul(ir.Read("x", (i,)), ir.Lit(2.0))),), kind="affine"))
+    p = _x_proc(seq)
+    fwd = interp.run(p, {})["x"]
+    assert list(fwd) == [1.0, 2.0, 4.0, 8.0]
+    with pytest.raises(interp.InterpError):
+        interp.run(p, {}, reverse_affine=True)

@@ -121,11 +121,12 @@ class _State:
             self.fresh[buf][t] = False
 
 
-def run(proc: ir.Proc, inputs: dict, trace=None):
+def run(proc: ir.Proc, inputs: dict, reverse_affine: bool = False):
     """Execute proc; returns {output name: array}. `inputs` maps arg name -> numpy array (any
     float dtype; bf16 inputs should be given as float32 arrays holding bf16-representable values
     with inputs['__dtypes__'] = {'name': 'bf16'})."""
     st = _State(proc, inputs)
+    st.reverse_affine = reverse_affine
     _exec(st, proc.body)
     return {b.name: st.bufs[b.name].copy() for b in proc.args if b.role == "out"}
 
@@ -147,7 +148,8 @@ def _exec(st: _State, stmts):
             st._alloc(s.buf)
         elif isinstance(s, ir.For):
             n = int(s.extent.eval(st.env))
-            for i in range(n):
+            order = range(n - 1, -1, -1) if (getattr(st, 'reverse_affine', False) and s.kind == 'affine') else range(n)
+            for i in order:
                 st.env[s.var] = i
                 _exec(st, s.body)
             st.env.pop(s.var, None)
