@@ -75,7 +75,12 @@ def trace(fn, lhsT: ArgSpec, rhs: ArgSpec, name: str = "kernel") -> ir.Proc:
         if spec.example is None:
             raise TraceError("ArgSpec.example (a concrete example shape) is required for tracing")
         ex.append(torch.randn(*spec.example).to(spec.torch_dtype()))
-    prog = torch.export.export(fn, tuple(ex))
+
+    class _Spec(torch.nn.Module):
+        def forward(self, a, b):
+            return fn(a, b)
+
+    prog = torch.export.export(_Spec(), tuple(ex))
     g = prog.graph_module.graph
 
     def target(n):
@@ -83,7 +88,8 @@ def trace(fn, lhsT: ArgSpec, rhs: ArgSpec, name: str = "kernel") -> ir.Proc:
 
     nodes = [n for n in g.nodes if n.op in ("call_function", "placeholder", "output")]
     allowed = {"aten.mm.default", "aten.t.default", "aten.permute.default", "aten._to_copy.default",
-               "aten.to.dtype", "aten.matmul.default", "aten.transpose.int"}
+               "aten.to.dtype", "aten.matmul.default", "aten.transpose.int", "aten.numpy_T.default",
+               "aten._assert_tensor_metadata.default"}
     for n in nodes:
         if n.op == "call_function" and target(n) not in allowed:
             raise TraceError(f"unsupported torch op in spec: {target(n)} (v0 supports mm / transpose / casts)")
@@ -96,7 +102,7 @@ def trace(fn, lhsT: ArgSpec, rhs: ArgSpec, name: str = "kernel") -> ir.Proc:
         """Follow t/permute/casts back to a placeholder; return (placeholder name, transposed?)."""
         while n.op == "call_function":
             t = target(n)
-            if t in ("aten.t.default", "aten.transpose.int") or (t == "aten.permute.default" and list(n.args[1]) == [1, 0]):
+            if t in ("aten.t.default", "aten.transpose.int", "aten.numpy_T.default") or (t == "aten.permute.default" and list(n.args[1]) == [1, 0]):
                 transposed = not transposed
             elif t not in ("aten._to_copy.default", "aten.to.dtype"):
                 raise TraceError(f"unsupported op feeding matmul: {t}")

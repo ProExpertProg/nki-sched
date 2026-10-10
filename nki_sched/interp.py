@@ -22,10 +22,10 @@ def quantize(dtype: str, x: np.ndarray) -> np.ndarray:
         return x.astype(np.float16).astype(np.float32)
     if dtype == "bf16":
         # round-to-nearest-even to the top 16 bits of the float32 pattern
-        u = x.view(np.uint32).astype(np.uint64)
-        lsb = (u >> 16) & 1
-        u = (u + 0x7FFF + lsb) & 0xFFFF0000
-        return u.astype(np.uint32).view(np.float32)
+        u = np.array(x, dtype=np.float32).view(np.uint32)
+        lsb = (u >> np.uint32(16)) & np.uint32(1)
+        u = (u + np.uint32(0x7FFF) + lsb) & np.uint32(0xFFFF0000)
+        return u.view(np.float32)
     raise ValueError(dtype)
 
 
