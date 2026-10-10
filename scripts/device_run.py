@@ -31,7 +31,13 @@ def main(path, entry, reps=5):
             b = r.standard_normal((K, N)).astype(dt)
             want = a.astype(np.float32).T @ b.astype(np.float32)
             t0 = time.perf_counter()
-            got = np.asarray(kernel(a, b)).astype(np.float32)  # first call compiles
+            try:
+                got = np.asarray(kernel(a, b)).astype(np.float32)  # first call compiles
+            except Exception as e:  # noqa: BLE001
+                if "NRT" in type(e).__name__ or "initialize NRT" in str(e):
+                    print("NeuronCores are not available (held by another process on this node?): " + str(e).splitlines()[0])
+                    sys.exit(3)
+                raise
             first = time.perf_counter() - t0
             ts = []
             for _ in range(reps):

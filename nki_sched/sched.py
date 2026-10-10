@@ -74,6 +74,13 @@ class Sched:
             raise ScheduleError(f"no buffer named '{name}'. Buffers: {list(ir.buffers_of(self.proc))}")
         return b
 
+    @staticmethod
+    def _const(e: Aff, what: str) -> int:
+        try:
+            return const_int(e, what)
+        except AnalysisError as err:
+            raise ScheduleError(f"{err}. Tile the loops so the window has a fixed size (e.g. split a symbolic loop).") from None
+
     def _fresh(self, name: str):
         if name in ir.buffers_of(self.proc) or name in ir.loop_vars(self.proc.body):
             raise ScheduleError(f"name '{name}' is already in use")
@@ -242,7 +249,7 @@ class Sched:
         except AnalysisError as e:
             raise ScheduleError(f"compute_at({stage}, at={at}): {e}") from None
         for z in size:
-            const_int(z, "required region size")
+            self._const(z, f"compute_at({stage}, at={at}): the region of '{stage}' read inside '{at}'")
 
         new_prods = []
         for nest in prods:
@@ -320,7 +327,7 @@ class Sched:
         except AnalysisError as e:
             raise ScheduleError(f"stage_{direction}({tensor}): {e}") from None
         for z in size:
-            const_int(z, f"staged window of '{tensor}'")
+            self._const(z, f"stage_{direction}({tensor}, at={at}): the window of '{tensor}' accessed inside '{at}'")
         nb = ir.Buffer(name, tuple(size), tb.dtype, mem, "temp")
         full = ir.Window(name, tuple(Aff(0) for _ in size), tuple(size))
         win = ir.Window(tensor, tuple(lo), tuple(size))

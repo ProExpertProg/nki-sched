@@ -9,12 +9,14 @@
 # Environment:
 #   ENV_FILE  file exporting AWS credentials     (default: $ROOT/../.env; pass it explicitly from a git worktree)
 #   POD       pod to use                         (default: seat-270)
+#   NKIBENCH_DIR  directory holding nkibench.py on the node (default: /workspace/projects/02-kernel-agent)
 #   PYTHON    interpreter with torch + numpy     (default: python3)
 #   SKIP_HW=1 skip step 3
 set -euo pipefail
 LEVEL_NAME=${1:?usage: device_check.sh l4|l5|l6|l7}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 POD=${POD:-seat-270}
+NKIBENCH_DIR=${NKIBENCH_DIR:-/workspace/projects/02-kernel-agent}
 PYTHON=${PYTHON:-python3}
 ENV_FILE=${ENV_FILE:-$ROOT/../.env}
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
@@ -29,7 +31,7 @@ kubectl cp -c app "$OUT" "$POD:/tmp/$NAME"
 kubectl cp -c app "$ROOT/scripts/sim_dtypes.py" "$POD:/tmp/sim_dtypes.py"
 kubectl cp -c app "$ROOT/scripts/device_run.py" "$POD:/tmp/device_run.py"
 echo "== 1. nkibench level $N =="
-kubectl exec "$POD" -c app -- bash -c "cd /workspace/projects/02-kernel-agent && python nkibench.py --level $N --check /tmp/$NAME" | grep -E "rules|numerics|HBM traffic|VIOLATION|FAILED" | cut -c1-160
+kubectl exec "$POD" -c app -- bash -c "cd $NKIBENCH_DIR && python nkibench.py --level $N --check /tmp/$NAME" | grep -E "rules|numerics|HBM traffic|VIOLATION|FAILED" | cut -c1-160
 echo "== 2. simulator, float32 + bfloat16 =="
 kubectl exec "$POD" -c app -- python /tmp/sim_dtypes.py "/tmp/$NAME" "$ENTRY"
 if [ -z "${SKIP_HW:-}" ]; then

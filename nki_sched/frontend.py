@@ -1,23 +1,40 @@
 """Torch frontend: a plain torch function is both the compiler input (traced with torch.export and
 expanded into the loop IR) and the correctness oracle (run eagerly).
 
-v0 supports exactly the op set needed for the matmul ladder: transpose/permute of an input,
-aten.mm, and dtype casts. Anything else fails at trace time with the offending op named.
+The exported ATen graph is walked node by node. Every tensor value is represented as a *virtual*
+tensor: a symbolic shape, a dtype and a function from indices to a data expression. Views and exact
+casts (transpose, permute, widening `.to`) just compose that function, so they cost nothing and never
+become loops. A matmul is the only op that *materializes* a stage (an f32 accumulator buffer with an
+init nest and a reduction nest); the graph output becomes a final pointwise stage that writes the
+kernel output. The resulting program is the naive, breadth-first loop nest every schedule starts from.
+
+Supported ops (anything else fails at trace time and is named in the error): aten.mm / aten.matmul on
+2-D operands, t / permute / transpose / numpy_T on 2-D values, dtype casts (`.to`, `.float()`, ...).
+
+Dtypes: buffers whose dtype equals the dtype of a kernel argument are emitted as "like:<arg>", so one
+traced kernel follows the dtype of its inputs (f32 or bf16 alike).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from . import ir
-from .expr import Aff, sym, var
+from .expr import Aff, Sym, var
 
-_DT = {"float32": "f32", "bfloat16": "bf16", "float16": "f16"}
+_TORCH_DT = {"torch.float32": "f32", "torch.bfloat16": "bf16", "torch.float16": "f16"}
+# casts a -> b that are exact (every a value is representable in b), so they can be elided
+_EXACT = {("f32", "f32"), ("bf16", "bf16"), ("f16", "f16"), ("bf16", "f32"), ("f16", "f32")}
+
+
+class TraceError(Exception):
+    pass
 
 
 @dataclass(frozen=True)
 class ArgSpec:
-    dims: tuple  # symbolic dim names, e.g. ("K", "M")
+    dims: tuple  # symbolic dim names (str) or constants (int), e.g. ("K", "M")
     dtype: str = "f32"
     example: tuple = None  # concrete example shape used for tracing / the oracle
 
@@ -31,101 +48,166 @@ def arg(dims, dtype="f32", example=None) -> ArgSpec:
     return ArgSpec(tuple(dims), dtype, tuple(example) if example is not None else None)
 
 
-class TraceError(Exception):
-    pass
+@dataclass(frozen=True)
+class _Val:
+    """A virtual tensor: shape (tuple of Aff), dtype, and idx-tuple -> data expression."""
+
+    shape: tuple
+    dtype: str
+    elem: Callable
 
 
-def matmul_proc(name: str, out_dtype: str = "like:lhsT") -> ir.Proc:
-    """Naive loop IR for C[m,n] = cast(sum_k lhsT[k,m] * rhs[k,n]) with a separate f32 accumulator
-    stage (init + update nests, Halide style) and a pointwise cast stage. Sizes K, M, N are
-    symbolic; dtypes follow the inputs ("like:lhsT")."""
-    K, M, N = sym("K"), sym("M"), sym("N")
-    lhsT = ir.Buffer("lhsT", (K, M), "like:lhsT", ir.HBM, "arg")
-    rhs = ir.Buffer("rhs", (K, N), "like:rhs", ir.HBM, "arg")
-    C = ir.Buffer("C", (M, N), out_dtype, ir.HBM, "out")
-    acc = ir.Buffer("acc", (M, N), "f32", ir.HBM, "temp")
+class _Builder:
+    def __init__(self, args: dict, output: str):
+        self.args = args
+        self.output = output
+        self.stmts = []
+        self.used = set(args) | {output}
 
-    def v(n):
-        return var(n)
+    # ---- naming ----------------------------------------------------------------
+    def dtype_ref(self, dt: str) -> str:
+        for name, spec in self.args.items():
+            if spec.dtype == dt:
+                return f"like:{name}"
+        return dt
 
-    init = ir.For("acc.init.m", M, (ir.For("acc.init.n", N, (
-        ir.Assign("acc", (v("acc.init.m"), v("acc.init.n")), ir.Lit(0.0)),), "acc.init"),), "acc.init")
-    upd = ir.For("acc.m", M, (ir.For("acc.n", N, (ir.For("acc.k", K, (
-        ir.Reduce("acc", (v("acc.m"), v("acc.n")),
-                  ir.Mul(ir.Read("lhsT", (v("acc.k"), v("acc.m"))), ir.Read("rhs", (v("acc.k"), v("acc.n"))))),), "acc"),), "acc"),), "acc")
-    cst = ir.For("C.m", M, (ir.For("C.n", N, (
-        ir.Assign("C", (v("C.m"), v("C.n")), ir.CastE(out_dtype, ir.Read("acc", (v("C.m"), v("C.n"))))),), "C"),), "C")
-    return ir.Proc(
-        name=name,
-        args=(lhsT, rhs, C),
-        sizes=(("K", "lhsT", 0), ("M", "lhsT", 1), ("N", "rhs", 1)),
-        body=(ir.Alloc(acc), init, upd, cst),
-        assumptions=(),
-    )
+    def unique(self, base: str) -> str:
+        name, i = base, 1
+        while name in self.used:
+            name = f"{base}_{i}"
+            i += 1
+        self.used.add(name)
+        return name
+
+    @staticmethod
+    def dim_names(shape, fallback):
+        out, seen = [], set()
+        for d, fb in zip(shape, fallback):
+            base = fb
+            if len(d.terms) == 1 and d.const == 0 and d.terms[0][1] == 1 and isinstance(d.terms[0][0], Sym):
+                base = d.terms[0][0].name.lower()
+            n, i = base, 1
+            while n in seen:
+                n = f"{base}{i}"
+                i += 1
+            seen.add(n)
+            out.append(n)
+        return out
+
+    # ---- loop nests ------------------------------------------------------------
+    @staticmethod
+    def nest(stage, loops, body):
+        """loops: [(varname, extent)] outermost first."""
+        for v, ext in reversed(loops):
+            body = (ir.For(v, ext, tuple(body), stage),)
+        return body[0]
+
+    # ---- ops -------------------------------------------------------------------
+    def view_transpose(self, x: _Val) -> _Val:
+        if len(x.shape) != 2:
+            raise TraceError("transpose is only supported on 2-D values")
+        return _Val(x.shape[::-1], x.dtype, lambda idx, x=x: x.elem(tuple(idx)[::-1]))
+
+    def cast(self, x: _Val, dt: str) -> _Val:
+        if (x.dtype, dt) in _EXACT:
+            return _Val(x.shape, dt, x.elem)
+        return _Val(x.shape, dt, lambda idx, x=x, dt=dt: ir.CastE(self.dtype_ref(dt), x.elem(idx)))
+
+    def matmul(self, node, x: _Val, y: _Val, res_dt: str) -> _Val:
+        if len(x.shape) != 2 or len(y.shape) != 2:
+            raise TraceError("matmul is only supported on 2-D operands")
+        if x.shape[1] != y.shape[0]:
+            raise TraceError(f"contraction dims differ: {x.shape[1]} vs {y.shape[0]}")
+        M, K, N = x.shape[0], x.shape[1], y.shape[1]
+        name = self.unique(node.name)
+        m, n, k = self.dim_names((M, N, K), ("m", "n", "k"))
+        buf = ir.Buffer(name, (M, N), "f32", ir.HBM, "temp")
+        vm, vn, vk = (var(f"{name}.{d}") for d in (m, n, k))
+        zm, zn = var(f"{name}.init.{m}"), var(f"{name}.init.{n}")
+        init = self.nest(f"{name}.init", [(zm.terms[0][0].name, M), (zn.terms[0][0].name, N)],
+                         (ir.Assign(name, (zm, zn), ir.Lit(0.0)),))
+        upd = self.nest(name, [(f"{name}.{m}", M), (f"{name}.{n}", N), (f"{name}.{k}", K)],
+                        (ir.Reduce(name, (vm, vn), ir.Mul(x.elem((vm, vk)), y.elem((vk, vn)))),))
+        self.stmts += [ir.Alloc(buf), init, upd]
+        # torch returns the operands' dtype; the accumulator is f32, so narrow if needed
+        out = _Val((M, N), "f32", lambda idx: ir.Read(name, tuple(idx)))
+        return out if res_dt == "f32" else self.cast(out, res_dt)
+
+    def finish(self, v: _Val) -> ir.Buffer:
+        dims = self.dim_names(v.shape, tuple(f"d{i}" for i in range(len(v.shape))))
+        idx = tuple(var(f"{self.output}.{d}") for d in dims)
+        out = ir.Buffer(self.output, v.shape, self.dtype_ref(v.dtype), ir.HBM, "out")
+        self.stmts.append(self.nest(self.output, [(f"{self.output}.{d}", e) for d, e in zip(dims, v.shape)],
+                                    (ir.Assign(self.output, idx, v.elem(idx)),)))
+        return out
 
 
-def trace(fn, lhsT: ArgSpec, rhs: ArgSpec, name: str = "kernel") -> ir.Proc:
-    """Trace `fn(lhsT, rhs)` with torch.export and expand to the naive loop IR."""
+def _dt(torch_dtype) -> str:
+    try:
+        return _TORCH_DT[str(torch_dtype)]
+    except KeyError:
+        raise TraceError(f"unsupported dtype {torch_dtype} (supported: float32, bfloat16, float16)") from None
+
+
+def trace(fn, args: dict, name: str = "kernel", output: str = "C") -> ir.Proc:
+    """Trace `fn(*args)` with torch.export and expand it to the naive loop IR.
+
+    args: ordered {argument name: ArgSpec}, in the order of fn's parameters.
+    name: entry-point name of the kernel; output: name of the output buffer."""
     import torch
 
-    if lhsT.dims[0] != rhs.dims[0]:
-        raise TraceError("contraction dims of lhsT and rhs must be the same symbol")
-    ex = []
-    for spec in (lhsT, rhs):
+    examples = []
+    for spec in args.values():
         if spec.example is None:
             raise TraceError("ArgSpec.example (a concrete example shape) is required for tracing")
-        ex.append(torch.randn(*spec.example).to(spec.torch_dtype()))
+        examples.append(torch.randn(*spec.example).to(spec.torch_dtype()))
 
     class _Spec(torch.nn.Module):
-        def forward(self, a, b):
-            return fn(a, b)
+        def forward(self, *a):
+            return fn(*a)
 
-    prog = torch.export.export(_Spec(), tuple(ex))
-    g = prog.graph_module.graph
+    graph = torch.export.export(_Spec(), tuple(examples)).graph_module.graph
+    b = _Builder(args, output)
+    env = {}
+    placeholders = iter(args.items())
+    result = None
 
-    def target(n):
-        return str(n.target) if n.op == "call_function" else n.op
+    for node in graph.nodes:
+        if node.op == "placeholder":
+            aname, spec = next(placeholders)
+            shape = tuple(Aff.of(d) for d in spec.dims)
+            env[node] = _Val(shape, spec.dtype, lambda idx, aname=aname: ir.Read(aname, tuple(idx)))
+        elif node.op == "output":
+            result = env[node.args[0][0]]
+        elif node.op == "call_function":
+            t = str(node.target)
+            a = node.args
+            if t == "aten._assert_tensor_metadata.default":
+                continue
+            elif t in ("aten.t.default", "aten.numpy_T.default"):
+                env[node] = b.view_transpose(env[a[0]])
+            elif t == "aten.transpose.int" and sorted(int(i) % 2 for i in a[1:3]) == [0, 1]:
+                env[node] = b.view_transpose(env[a[0]])
+            elif t == "aten.permute.default" and list(a[1]) == [1, 0]:
+                env[node] = b.view_transpose(env[a[0]])
+            elif t in ("aten.to.dtype", "aten._to_copy.default"):
+                dt = a[1] if len(a) > 1 else node.kwargs.get("dtype")
+                env[node] = b.cast(env[a[0]], _dt(dt))
+            elif t in ("aten.mm.default", "aten.matmul.default"):
+                env[node] = b.matmul(node, env[a[0]], env[a[1]], _dt(node.meta["val"].dtype))
+            else:
+                raise TraceError(f"unsupported torch op in spec: {t} (supported: mm/matmul, t/permute/transpose, dtype casts)")
+    if result is None:
+        raise TraceError("the spec has no tensor output")
 
-    nodes = [n for n in g.nodes if n.op in ("call_function", "placeholder", "output")]
-    allowed = {"aten.mm.default", "aten.t.default", "aten.permute.default", "aten._to_copy.default",
-               "aten.to.dtype", "aten.matmul.default", "aten.transpose.int", "aten.numpy_T.default",
-               "aten._assert_tensor_metadata.default"}
-    for n in nodes:
-        if n.op == "call_function" and target(n) not in allowed:
-            raise TraceError(f"unsupported torch op in spec: {target(n)} (v0 supports mm / transpose / casts)")
-    mms = [n for n in nodes if n.op == "call_function" and target(n) in ("aten.mm.default", "aten.matmul.default")]
-    if len(mms) != 1:
-        raise TraceError(f"expected exactly one matmul in the spec, found {len(mms)}")
-    mm = mms[0]
-
-    def root(n, transposed=False):
-        """Follow t/permute/casts back to a placeholder; return (placeholder name, transposed?)."""
-        while n.op == "call_function":
-            t = target(n)
-            if t in ("aten.t.default", "aten.transpose.int", "aten.numpy_T.default") or (t == "aten.permute.default" and list(n.args[1]) == [1, 0]):
-                transposed = not transposed
-            elif t not in ("aten._to_copy.default", "aten.to.dtype"):
-                raise TraceError(f"unsupported op feeding matmul: {t}")
-            n = n.args[0]
-        return n.target, transposed
-
-    a_name, a_t = root(mm.args[0])
-    b_name, b_t = root(mm.args[1])
-    phs = [n.target for n in nodes if n.op == "placeholder"]
-    if (a_name, b_name) != (phs[0], phs[1]) or not a_t or b_t:
-        raise TraceError("v0 expects  lhsT.T @ rhs  (first arg transposed, second arg as-is)")
-
-    out_dtype = lhsT.dtype if _out_dtype(g, mm) in (None, lhsT.dtype) else _out_dtype(g, mm)
-    out = "like:lhsT" if out_dtype == lhsT.dtype else out_dtype
-    proc = matmul_proc(name, out)
-    return proc
-
-
-def _out_dtype(g, mm):
-    """dtype of a cast applied to the matmul result, if any."""
-    for n in g.nodes:
-        if n.op == "call_function" and str(n.target) in ("aten._to_copy.default", "aten.to.dtype") and n.args[0] is mm:
-            dt = n.kwargs.get("dtype") or (n.args[1] if len(n.args) > 1 else None)
-            if dt is not None:
-                return _DT.get(str(dt).replace("torch.", ""))
-    return None
+    out = b.finish(result)
+    buffers = tuple(
+        ir.Buffer(aname, tuple(Aff.of(d) for d in spec.dims), f"like:{aname}", ir.HBM, "arg") for aname, spec in args.items()
+    ) + (out,)
+    sizes, seen = [], set()
+    for aname, spec in args.items():
+        for i, d in enumerate(spec.dims):
+            if isinstance(d, str) and d not in seen:
+                seen.add(d)
+                sizes.append((d, aname, i))
+    return ir.Proc(name=name, args=buffers, sizes=tuple(sizes), body=tuple(b.stmts))

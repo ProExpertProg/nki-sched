@@ -1,6 +1,6 @@
 # nki-sched — schedule language draft (v0)
 
-Status: **partly implemented.** The matmul ladder (§4.1, §4.2 and the full-residency form of §4.3) runs end to end: the schedules below are the real code in `nki_sched/schedules.py`, checked after every primitive against eager torch and, for the emitted kernels, `nkibench` on `seat-270`. Sections or rows marked *(planned)* are still design only: symbolic block factors, K-blocking, `multibuffer`/`pipeline`/`overlap`, `set_engine`, pattern cursors (`s.find`), and `transpose_input`. In v0 a handle is just a unique loop/buffer name. Names are provisional. Items marked `[verify]` depend on NKI behaviour not yet confirmed (nki 0.6.0, see PLAN §3).
+Status: **partly implemented.** The tiled matmul (§1, §2 partly, §3 partly, §4.1, §4.2) runs end to end; the schedules shown are the real code in `examples/`. Sections or rows marked *(planned)* are design only: symbolic block factors, K-blocking, `multibuffer`/`pipeline`/`overlap`, `set_engine`, pattern cursors (`s.find`), `fold_partition`, `transpose_input`. In v0 a handle is just a unique loop/buffer name. Names are provisional. Items marked `[verify]` depend on NKI behaviour not yet confirmed (nki 0.6.0, see PLAN §3).
 
 ## 0. Two program levels (and their names)
 
@@ -20,47 +20,38 @@ Design rule: *the syntax is Halide/TVM-flavoured names (`split`, `reorder`, `com
 The high-level spec is plain torch. It is both the **input to the compiler** (traced) and the **correctness oracle** (run eagerly).
 
 ```python
-import torch, nki_sched as nks
-from nki_sched import hw
-from nki_sched.mem import HBM, SBUF, PSUM
-from nki_sched import ns                      # the ns-level instruction namespace: ns.<engine>.<inst>
+from nki_sched import arg, trace
 
-# Dims are symbolic in the IR; the example shapes are only used to trace and to run the oracle.
-K, M, N = 512, 256, 1024
+def matmul(lhsT, rhs):             # lhsT: [K, M], rhs: [K, N]
+    return lhsT.T @ rhs            # -> [M, N]
 
-def matmul(lhsT: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:   # [K,M], [K,N]
-    return (lhsT.T.float() @ rhs.float()).to(torch.bfloat16)          # -> [M,N]
-
-prog = nks.trace(matmul,
-                lhsT=nks.arg(("K", "M"), "bf16", example=(K, M)),
-                rhs =nks.arg(("K", "N"), "bf16", example=(K, N)),
-                name="nki_matmul_tiled_")      # kernel entry name expected by nkibench
-print(prog)                                    # the naive IR below
+# Dims are symbolic in the IR; the example shapes are only used for tracing.
+proc = trace(matmul, {"lhsT": arg(("K", "M"), "bf16", example=(8, 4)),
+                      "rhs":  arg(("K", "N"), "bf16", example=(8, 8))}, name="matmul_kernel")
+print(proc)                        # the naive IR below
 ```
 
-Layout: the spec takes `lhsT` (K on axis 0), same as `nkibench`/NKI tutorial kernels, so the contraction axis is already the partition axis for both operands. Taking plain `A[M,K]` is supported later via a layout primitive (§5).
+`trace` exports the function with `torch.export` and walks the ATen graph generically (`nki_sched/frontend.py`): transposes/permutes and exact (widening) casts are views that just remap indices, `mm`/`matmul` materializes a stage (an f32 accumulator with an init nest and a reduction nest), and the output becomes a final pointwise stage. Anything else fails at trace time with the op's name. The hand-written IR for this spec lives in `tests/test_frontend.py`.
+
+Layout: the spec takes `lhsT` (K on axis 0), same as `nkibench`/NKI tutorial kernels, so the contraction axis is already the partition axis for both operands. `A[M,K]` specs also trace (`a @ b`), but `replace(ns.tensor.matmul)` will refuse the stationary operand until a transposed copy is staged (a layout primitive is planned).
 
 ### Naive IR that `trace` produces (Halide-style: stages, breadth-first, "root" allocs)
 
 ```
-stage acc   : f32[M,N]    = Σ_k lhsT[k,m] * rhs[k,n]      # reduction stage: init + update
-stage C     : bf16[M,N]   = cast_bf16(acc[m,n])           # pointwise stage (the output)
-
-# lowered to explicit loops (this is the program every schedule starts from)
-alloc acc : f32[M,N] @ HBM
-for acc.m in 0..M:           # init
-  for acc.n in 0..N:
-    acc[acc.m, acc.n] = 0
-for acc.m in 0..M:           # update
-  for acc.n in 0..N:
-    for acc.k in 0..K:
-      acc[acc.m, acc.n] += lhsT[acc.k, acc.m] * rhs[acc.k, acc.n]
-for C.m in 0..M:
-  for C.n in 0..N:
-    C[C.m, C.n] = cast_bf16(acc[C.m, C.n])
+  alloc matmul : f32[M, N] @ HBM
+  for matmul.init.m in 0..M:
+    for matmul.init.n in 0..N:
+      matmul[matmul.init.m, matmul.init.n] = 0.0
+  for matmul.m in 0..M:
+    for matmul.n in 0..N:
+      for matmul.k in 0..K:
+        matmul[matmul.m, matmul.n] += lhsT[matmul.k, matmul.m] * rhs[matmul.k, matmul.n]
+  for C.m in 0..M:
+    for C.n in 0..N:
+      C[C.m, C.n] = cast_like:lhsT(matmul[C.m, C.n])
 ```
 
-Loops are auto-named `stage.var`; renamed by `split`/`fuse`. This IR is directly executable by the numpy interpreter — it is the first thing diffed against `matmul()` in torch.
+Loops are auto-named `stage.var`; renamed by `split`/`fuse`. This IR is directly executable by the numpy interpreter, so every intermediate program can be diffed against the torch function.
 
 ---
 
@@ -72,15 +63,15 @@ Three complementary mechanisms; all produce **cursors** (opaque handles into the
 @nks.schedule
 def sched(s: nks.Sched):
     # (a) by auto-name — Halide/TVM style, the common case
-    m = s.loop("C.m");   k = s.loop("acc.k")
-    A = s.buf("acc");    st = s.stage("acc")          # tensor / stage references
+    m = s.loop("C.m");   k = s.loop("matmul.k")
+    A = s.buf("matmul");    st = s.stage("matmul")          # tensor / stage references
 
     # (b) by return value — primitives hand back the new cursors
     mo, mi = s.split(m, 128)                          # old handle `m` now forwards to `mo` (outer)
 
     # (c) by pattern — Exo style, for things with no name
     mm_nest = s.find("for ki in _: _")                # first loop with that name
-    first_upd = s.find("acc[_] += _")                 # a statement pattern
+    first_upd = s.find("matmul[_] += _")                 # a statement pattern
     second = s.find("for _ in _: _ #1")               # `#n` picks the (n+1)-th match
     ld = s.find_all("lhsT_sb[_] = lhsT[_]")           # many=True
 
@@ -135,23 +126,23 @@ Every primitive: `(preconditions checked) → rewrite → (cursor forwarding fn)
 
 Each schedule is a Python function; constants (`BM`, `depth`…) are plain parameters, so a schedule is also a **tunable template** (TVM knobs).
 
-### 4.1 Level 4 — tiled matmul (implemented; lowers to `reference_level4.py`'s structure)
+### 4.1 Tiled matmul (implemented: `examples/matmul_ladder.py`, `l4`)
 
 ```python
 def l4(s, hw):
     mo, mi = s.split("C.m", hw.stationary_fmax, names=("mo", "mi"), perfect=True)   # 128
     no, ni = s.split("C.n", hw.moving_fmax, names=("no", "ni"), perfect=True)       # 512
     s.reorder(mo, no, mi, ni)
-    s.compute_at("acc", at=no)              # acc tile computed per output tile; region inferred: [128, 512]
-    ko, ki = s.split("acc.k", hw.pmax, names=("ko", "ki"), perfect=True)            # 128
-    s.reorder(ko, ki, "acc.m", "acc.n")     # legal: + is associative (reduction rule)
-    s.set_memory("acc", PSUM)               # f32, 128 partitions x 512 = one bank
+    s.compute_at("matmul", at=no)           # accumulator tile computed per output tile; region inferred: [128, 512]
+    ko, ki = s.split("matmul.k", hw.pmax, names=("ko", "ki"), perfect=True)         # 128
+    s.reorder(ko, ki, "matmul.m", "matmul.n")   # legal: + is associative (reduction rule)
+    s.set_memory("matmul", PSUM)            # f32, 128 partitions x 512 = one bank
     s.stage_in("lhsT", at=ko, mem=SBUF, name="lhsT_sb")   # window inferred [ko*128:+128, mo*128:+128]
     s.stage_in("rhs",  at=ko, mem=SBUF, name="rhs_sb")    # window inferred [ko*128:+128, no*512:+512]
     s.stage_out("C",   at=no, mem=SBUF, name="C_sb")      # cast-out staging, then DMA to HBM
     s.replace(ki, "ns.tensor.matmul")       # k=partition, m=stationary free, n=moving free
-    s.fold_init("acc")                      # first matmul into the fresh PSUM tile overwrites
-    # The cast-out nest C_sb[mi,ni] = cast(acc[mi,ni]) is recognised as a pure copy at emission and
+    s.fold_init("matmul")                   # first matmul into the fresh PSUM tile overwrites
+    # The cast-out nest C_sb[mi,ni] = matmul[mi,ni] is recognised as a pure copy at emission and
     # becomes ns.vector.tensor_copy (implicit instruction selection for copies).
 ```
 
@@ -163,33 +154,35 @@ ns-level IR after the schedule (`print(s.show())`, before emission turns the cas
   for mo in 0..(M // 128):
     for no in 0..(N // 512):
       alloc C_sb : like:lhsT[128, 512] @ SBUF
-      alloc acc : f32[128, 512] @ PSUM
+      alloc matmul : f32[128, 512] @ PSUM
       for ko in 0..(K // 128):
         alloc rhs_sb : like:rhs[128, 512] @ SBUF
         ns.sync.dma_copy(dst=rhs_sb[0:+128, 0:+512], src=rhs[128*ko:+128, 512*no:+512])
         alloc lhsT_sb : like:lhsT[128, 128] @ SBUF
         ns.sync.dma_copy(dst=lhsT_sb[0:+128, 0:+128], src=lhsT[128*ko:+128, 128*mo:+128])
-        ns.tensor.matmul(dst=acc[0:+128, 0:+512], stationary=lhsT_sb[0:+128, 0:+128], moving=rhs_sb[0:+128, 0:+512], accumulate=None)
+        ns.tensor.matmul(dst=matmul[0:+128, 0:+512], stationary=lhsT_sb[0:+128, 0:+128], moving=rhs_sb[0:+128, 0:+512], accumulate=None)
       for mi in 0..128:
         for ni in 0..512:
-          C_sb[mi, ni] = cast_like:lhsT(acc[mi, ni])
+          C_sb[mi, ni] = matmul[mi, ni]
       ns.sync.dma_copy(dst=C[128*mo:+128, 512*no:+512], src=C_sb[0:+128, 0:+512])
 ```
 
-The emitter lowers each `ns.<engine>.<inst>` to its NKI form (`ns.tensor.matmul` → `nisa.nc_matmul`, `ns.vector.tensor_copy` → `nisa.tensor_copy`, `ns.sync.dma_copy` → `nisa.dma_copy`; `engine=` is only emitted after an explicit `set_engine`). **Measured on `seat-270` (nki.simulate): passes `nkibench --level 4 --check`, traffic 1.00 / 1.56 / 1.00 / 2.00× the floor on the four shapes.**
+The emitter lowers each `ns.<engine>.<inst>` to its NKI form (`ns.tensor.matmul` → `nisa.nc_matmul`, `ns.vector.tensor_copy` → `nisa.tensor_copy`, `ns.sync.dma_copy` → `nisa.dma_copy`; `engine=` is only emitted after an explicit `set_engine`). The emitted kernel passes `nkibench --level 4` in the simulator on a Trainium node (HBM traffic 1.00 / 1.56 / 1.00 / 2.00× the floor on its four shapes) and `tests/test_examples.py` pins the same ratios statically.
 
-### 4.2 Level 5 — hoist the big operand's loads out of the loop that doesn't index it (implemented; bar ≤1.6×)
+### 4.2 Hoisting (examples only: `l5`–`l7`)
 
-Hoisting a load out of `ko` alone saves nothing (each tile is still read once per output tile — L4 already does that). The saving comes from hoisting across `mo`/`no`: `rhs[:, no-strip]` does not depend on `mo`, so with `no` outermost it is loaded once per `no`. `rhs` is the larger operand, so hoist that one (hoisting only `lhsT` strips gives 1.86× — fails the bar; see table).
+`hoist(buf, to=loop)` moves a staged buffer's fill out of the loops between `to` and the original site. A loop that strides the source window by exactly one tile *grows* the buffer (over the partition axis the tiles fold into a new axis: `[128, K/128, 512]`, the tile index being an integer-indexed "point" axis of the matmul operand); a loop that does not index the source reuses the data.
 
 ```python
 def l5(s, hw):
     l4(s, hw)
     s.reorder("no", "mo")          # independent output-tile loops: any order is legal
-    s.hoist("rhs_sb", to="no")     # the fill moves to `no`; the buffer grows along ko over the partition axis
-```
+    s.hoist("rhs_sb", to="no")     # rhs strip loaded once per `no` instead of once per (mo, no)
 
-`hoist` folds the grown K axis into a new axis 1 (`[128, K/128, 512]`, K>128 can't live on the partition axis); the matmul reads `rhs_sb[0:128, ko, 0:512]` (an integer-indexed axis, "point"). IR:
+def l6(s, hw):                     # l7 is the same schedule
+    l5(s, hw)
+    s.hoist("lhsT_sb", to=None)    # all of lhsT resident at the top of the kernel
+```
 
 ```
   for no in 0..(N // 512):
@@ -198,91 +191,18 @@ def l5(s, hw):
       ns.sync.dma_copy(dst=rhs_sb[0:+128, rhs_sb_ko_ld, 0:+512], src=rhs[128*rhs_sb_ko_ld:+128, 512*no:+512])
     for mo in 0..(M // 128):
       alloc C_sb : like:lhsT[128, 512] @ SBUF
-      alloc acc : f32[128, 512] @ PSUM
+      alloc matmul : f32[128, 512] @ PSUM
       for ko in 0..(K // 128):
         alloc lhsT_sb : like:lhsT[128, 128] @ SBUF
         ns.sync.dma_copy(dst=lhsT_sb[0:+128, 0:+128], src=lhsT[128*ko:+128, 128*mo:+128])
-        ns.tensor.matmul(dst=acc[0:+128, 0:+512], stationary=lhsT_sb[0:+128, 0:+128], moving=rhs_sb[0:+128, ko, 0:+512], accumulate=None)
+        ns.tensor.matmul(dst=matmul[0:+128, 0:+512], stationary=lhsT_sb[0:+128, 0:+128], moving=rhs_sb[0:+128, ko, 0:+512], accumulate=None)
       for mi in 0..128:
         for ni in 0..512:
-          C_sb[mi, ni] = cast_like:lhsT(acc[mi, ni])
+          C_sb[mi, ni] = matmul[mi, ni]
       ns.sync.dma_copy(dst=C[128*mo:+128, 512*no:+512], src=C_sb[0:+128, 0:+512])
 ```
 
-**Measured: passes `nkibench --level 5`; traffic 1.00 / 1.11 / 1.00 / 1.14× — exactly the analytic prediction below.**
-
-### 4.3 Level 6/7 — implemented as *full residency*; symbolic blocking is *(planned)*
-
-**What exists (`l6` = `l7`):** on top of `l5`, `s.hoist("lhsT_sb", to=None)` puts the whole `lhsT` in SBUF at the top of the kernel, so every operand is read exactly once (byte floor). There are no block loops; the SBUF footprint grows with K·M, and the emitted kernel `assert`s a conservative footprint bound against the SBUF budget (`[unverified]` 192 KiB/partition). **Measured: passes `nkibench --level 6` and `--level 7`, traffic 1.00× on all four shapes.** This meets the traffic bars but is *not* the tutorial's blocked structure and does not scale past SBUF capacity.
-
-```
-  alloc lhsT_sb : like:lhsT[128, (K // 128), 128*(M // 128)] @ SBUF
-  for lhsT_sb_ko_ld in 0..(K // 128):
-    for lhsT_sb_mo_ld in 0..(M // 128):
-      ns.sync.dma_copy(dst=lhsT_sb[0:+128, lhsT_sb_ko_ld, 128*lhsT_sb_mo_ld:+128], src=lhsT[128*lhsT_sb_ko_ld:+128, 128*lhsT_sb_mo_ld:+128])
-  for no in 0..(N // 512):
-    alloc rhs_sb : like:rhs[128, (K // 128), 512] @ SBUF
-    for rhs_sb_ko_ld in 0..(K // 128):
-      ns.sync.dma_copy(dst=rhs_sb[0:+128, rhs_sb_ko_ld, 0:+512], src=rhs[128*rhs_sb_ko_ld:+128, 512*no:+512])
-    for mo in 0..(M // 128):
-      alloc C_sb : like:lhsT[128, 512] @ SBUF
-      alloc acc : f32[128, 512] @ PSUM
-      for ko in 0..(K // 128):
-        ns.tensor.matmul(dst=acc[0:+128, 0:+512], stationary=lhsT_sb[0:+128, ko, 128*mo:+128], moving=rhs_sb[0:+128, ko, 0:+512], accumulate=None)
-      for mi in 0..128:
-        for ni in 0..512:
-          C_sb[mi, ni] = cast_like:lhsT(acc[mi, ni])
-      ns.sync.dma_copy(dst=C[128*mo:+128, 512*no:+512], src=C_sb[0:+128, 0:+512])
-```
-
-**What is still design (*planned*):** real blocking needs symbolic block factors (`BM = min(4, M//128)`, so one file serves all shapes), i.e. `split` with a non-integer factor, and K-blocking with several PSUM tiles live. The sketch below is that design:
-
-This is a *re-placement*, not a reorder of the L4 nest: the accumulator is computed per **block** of `BM×BN` output tiles, and `acc`'s own loops are re-tiled with `kb` outermost. Everything is expressed with `split` + `compute_at` + `reorder` on loops that are perfect nests at that point (init is its own nest, so there is nothing between the loops).
-
-```python
-@nks.schedule
-def l7(s, BM=None, BN=None, BK=None):
-    M, N, K = s.size("M"), s.size("N"), s.size("K")          # symbolic: resolved when the kernel runs on a shape
-    BM = BM or min(4, M // 128)                              # knobs are functions of the sizes
-    BN = BN or min(2, N // 512)                              # (a fixed BM=4 would not divide M=128)
-    BK = BK or min(4, K // 128)
-
-    mb, mt = s.split("C.m", BM * 128);  nb, nt = s.split("C.n", BN * 512)
-    s.reorder(mb, nb, mt, nt)
-    s.compute_at("acc", at=nb)                               # acc block: [BM*128, BN*512] = BM*BN PSUM tiles
-    s.set_memory("acc", PSUM); s.check_capacity()            # fails loudly if BM*BN tiles exceed PSUM
-
-    am, an, ak = s.loops("acc")                              # acc.m, acc.n, acc.k restricted to this block
-    kb, kt = s.split(ak, BK * 128)                           # K blocking: kb outermost, accumulate in PSUM across it
-    ko, ki = s.split(kt, 128); mo, mi = s.split(am, 128); no, ni = s.split(an, 512)
-    s.reorder(kb, ko, mo, no, ki, mi, ni)                    # legal: + is associative (reduction rule)
-
-    s.stage_in("lhsT", at=kb, mem=SBUF, name="lhsT_sb")      # [BK*128, BM*128] folded to [128, BK, BM*128]
-    s.stage_in("rhs",  at=kb, mem=SBUF, name="rhs_sb")       # [BK*128, BN*512] folded to [128, BK, BN*512]
-    s.stage_out("C",   at=nb, mem=SBUF, name="C_sb")
-    s.fold_init("acc")
-    s.replace(s.find("for ki in _: _"), ns.tensor.matmul)
-```
-
-`l6` is the same schedule with `BK = K//128` (a single `kb` iteration — no K blocking). `l4` ≡ `BM=BN=1`, one `kb` per `ko`.
-
-### 4.3.1 HBM traffic: analytic model, confirmed on the simulator for l4 / l5 / l6 / l7
-
-Computed with the same accounting as `nkibench` (bytes moved by `dma_copy`, loads + the output store, against a floor of inputs + output), analytically from the schedule's staging windows. The model reproduces the L4 "2.0×" figure nkibench quotes for K=256, M=512, N=1024, and the simulator runs below agree with every row that was run (l4: 1.00 1.56 1.00 2.00; l5: 1.00 1.11 1.00 1.14; l6/l7: 1.00 on all four). Shapes are the four in `_MM_SHAPES`, ordered (K,M,N) = (128,128,512), (256,256,1024), (512,128,512), (256,512,1024):
-
-| schedule | knobs | ratio vs floor on the 4 shapes | worst | bar |
-|---|---|---|---|---|
-| `l4` (≡ blocks of 1 tile) | — | 1.00 1.56 1.00 2.00 | 2.00 | none |
-| `l5` hoist `rhs` strip (order no→mo) | — | 1.00 1.11 1.00 1.14 | **1.14** | ≤1.6 ✓ |
-| hoist `lhsT` strip only (the *wrong* L5) | — | 1.00 1.44 1.00 1.86 | 1.86 | ≤1.6 ✗ |
-| `l7`/`l6` strips blocked | BM=2, BN=2 | 1.00 1.00 1.00 1.29 | 1.29 | ≤1.25 ✗ |
-| `l7`/`l6` strips blocked | BM=4, BN=1 | 1.00 1.11 1.00 1.14 | 1.14 | L6 ≤1.25 ✓, L7 ≤1.05 ✗ |
-| `l7`/`l6` strips blocked (**defaults**) | BM=4, BN=2 | 1.00 1.00 1.00 1.00 | **1.00** | L6 ✓, L7 ≤1.05 ✓ |
-
-Observations the plan must respect:
-1. Blocked-strip traffic is `ceil(N/BN·512)·|lhsT| + ceil(M/BM·128)·|rhs| + |C|`; K-blocking (`BK`) does **not** change it when `acc` stays in PSUM across `kb` — so on the nkibench shapes L6 and L7 are indistinguishable by bytes once the blocks cover M and N. `BK` exists for SBUF *capacity* at larger K, not for these bars.
-2. The defaults (BM=4, BN=2) keep 8 PSUM tiles live. Whether that fits depends on the PSUM bank count/size (`[verify]`, PLAN §3.2); if only fewer fit, L7's 1.05 bar fails on the largest shape (the BM=4, BN=1 row), and `check_capacity()` reports it — the static analysis catches this before any device run.
-3. Both numbers in the "wrong" rows are what `s.hbm_bytes()` would print at schedule-authoring time.
+**These are not general.** They keep whole operand strips in SBUF, so they only work while K·M and K·N fit on chip; the emitted kernel asserts a conservative footprint bound and fails loudly otherwise. They exist to exercise `hoist` and are not a blocking strategy. Real blocking needs symbolic block factors (`split` by `min(4, M//128)` so one file serves every shape) and K-blocking with several live PSUM tiles; neither is implemented.
 
 ### 4.5 Beyond the ladder — overlap (device-measured, not in the simulator)
 
@@ -295,7 +215,7 @@ def l8(s, depth=2):
     s.pipeline("kb", stages=[s.find_all("ns.sync.dma_copy(lhsT_sb, _)") + s.find_all("ns.sync.dma_copy(rhs_sb, _)"),
                              s.find_all("ns.tensor.matmul(_)")], lag=1)
     # PSUM ping-pong: evacuate tile t while TensorE accumulates t+1
-    s.multibuffer("acc", 2, along="nb")
+    s.multibuffer("matmul", 2, along="nb")
     s.pipeline("nb", stages=[[s.find("for mo in _: _")], [s.find("tensor_copy(C_sb, _)"),
                                                         s.find("dma_copy(C[_], C_sb)")]], lag=1)
     s.set_engine(s.find("ns.vector.tensor_copy(C_sb, _)"), ns.scalar)   # e.g. rebalance evacuation off the vector engine; tensor_copy accepts engine= (verified)
@@ -310,18 +230,18 @@ What `pipeline` *means on NKI 0.6.0*: no explicit sync API exists, so it is a **
 Lesson from this repo (`STATE.md`): the quality of the checker's message is the product. Every legality failure names the primitive, the violated rule, and the offending program locations:
 
 ```
-ScheduleError in reorder(acc.k, acc.m) at l4.py:14
-  cannot move 'acc.k' outside 'acc.m': 'acc.m' contains two statements in its body
+ScheduleError in reorder(matmul.k, matmul.m) at l4.py:14
+  cannot move 'matmul.k' outside 'matmul.m': 'matmul.m' contains two statements in its body
   (the reduction nest and the cast nest 'C'), so the nest is not perfect.
-  hint: compute_at("acc", at=...) first, or fission 'acc.m' so each nest is separate.
+  hint: compute_at("matmul", at=...) first, or fission 'matmul.m' so each nest is separate.
 
 ScheduleError in reorder(mo, ko)
-  would reverse dependence: acc_t[...] += ... (update, reads PSUM written in ko) vs tensor_copy(C_sb, acc) (reads after last ko)
+  would reverse dependence: acc_t[...] += ... (update, reads PSUM written in ko) vs tensor_copy(C_sb, matmul) (reads after last ko)
   hint: the copy-out must stay outside the 'ko' loop.
 
-ScheduleError in set_memory("acc", PSUM)
-  acc has shape [256,512] f32: axis 0 (partition) = 256 > 128
-  hint: split 'acc.m' by 128 and compute_at the inner tile.
+ScheduleError in set_memory("matmul", PSUM)
+  matmul has shape [256,512] f32: axis 0 (partition) = 256 > 128
+  hint: split 'matmul.m' by 128 and compute_at the inner tile.
 
 ScheduleError in l6.check_capacity()
   PSUM: BM*BN = 8 live fp32 tiles of [128,512] need 8 banks; HardwareConfig.psum_banks = <probed value>   [hw numbers from the M0 probe, not assumed]

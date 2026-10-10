@@ -96,3 +96,26 @@ def injective(idx: tuple, loops: dict) -> bool:
             if not ext.is_const or c2 < c1 * ext.const:
                 return False
     return set(seen) == set(loops)
+
+
+def dma_bytes(proc, sizes: dict, itemsize: int = 4) -> int:
+    """Bytes moved by ns.sync.dma_copy instructions when the kernel runs on the given sizes
+    (e.g. {"K": 256, "M": 256, "N": 1024}): window elements x trip counts x itemsize. This is the
+    static counterpart of what nkibench counts at simulation time."""
+    env = dict(sizes)
+    for name, expr in proc.params:
+        env[name] = expr.eval(env)
+
+    def rec(stmts, mult):
+        total = 0
+        for s in stmts:
+            if isinstance(s, ir.For):
+                total += rec(s.body, mult * s.extent.eval(env))
+            elif isinstance(s, ir.Call) and s.instr == "ns.sync.dma_copy":
+                elems = 1
+                for z in s.arg("dst").shape():
+                    elems *= z.eval(env)
+                total += mult * elems * itemsize
+        return total
+
+    return rec(proc.body, 1)

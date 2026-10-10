@@ -19,7 +19,8 @@ def quantize(dtype: str, x: np.ndarray) -> np.ndarray:
     if dtype == "f32":
         return x
     if dtype == "f16":
-        return x.astype(np.float16).astype(np.float32)
+        with np.errstate(over="ignore"):  # overflow to inf is the intended f16 behaviour
+            return x.astype(np.float16).astype(np.float32)
     if dtype == "bf16":
         # round-to-nearest-even to the top 16 bits of the float32 pattern
         u = np.array(x, dtype=np.float32).view(np.uint32)
@@ -36,6 +37,7 @@ class InterpError(Exception):
 class _State:
     def __init__(self, proc: ir.Proc, inputs: dict):
         self.proc = proc
+        self.reverse_affine = False
         self.bufs = {}
         self.fresh = {}  # name -> bool mask: True where not yet written since allocation
         self.dtypes = {}
@@ -124,10 +126,11 @@ class _State:
 def run(proc: ir.Proc, inputs: dict, reverse_affine: bool = False):
     """Execute proc; returns {output name: array}. `inputs` maps arg name -> numpy array (any
     float dtype; bf16 inputs should be given as float32 arrays holding bf16-representable values
-    with inputs['__dtypes__'] = {'name': 'bf16'})."""
+    with inputs['__dtypes__'] = {'name': 'bf16'}). With reverse_affine, loops whose kind is
+    "affine" run their iterations in reverse order (used to test loop-kind claims)."""
     st = _State(proc, inputs)
     st.reverse_affine = reverse_affine
-    _exec(st, proc.body)
+    _exec_block(st, proc.body)
     return {b.name: st.bufs[b.name].copy() for b in proc.args if b.role == "out"}
 
 
@@ -142,62 +145,98 @@ def _dtype_of(arr, override):
     return "f32"
 
 
-def _exec(st: _State, stmts):
+# ---------------------------------------------------------------- statements
+def _exec_alloc(st: _State, s: ir.Alloc):
+    st._alloc(s.buf)
+
+
+def _exec_for(st: _State, s: ir.For):
+    n = int(s.extent.eval(st.env))
+    order = range(n - 1, -1, -1) if (st.reverse_affine and s.kind == "affine") else range(n)
+    for i in order:
+        st.env[s.var] = i
+        _exec_block(st, s.body)
+    st.env.pop(s.var, None)
+
+
+def _exec_assign(st: _State, s: ir.Assign):
+    st.store(s.buf, st.idx(s.buf, s.idx), st.ev(s.rhs))
+
+
+def _exec_reduce(st: _State, s: ir.Reduce):
+    st.store(s.buf, st.idx(s.buf, s.idx), st.ev(s.rhs), accumulate=True)
+
+
+def _exec_call(st: _State, c: ir.Call):
+    try:
+        handler = CALLS[c.instr]
+    except KeyError:
+        raise InterpError(f"unknown instruction {c.instr}") from None
+    handler(st, c)
+
+
+STMTS = {
+    ir.Alloc: _exec_alloc,
+    ir.For: _exec_for,
+    ir.Assign: _exec_assign,
+    ir.Reduce: _exec_reduce,
+    ir.Call: _exec_call,
+}
+
+
+def _exec_block(st: _State, stmts):
     for s in stmts:
-        if isinstance(s, ir.Alloc):
-            st._alloc(s.buf)
-        elif isinstance(s, ir.For):
-            n = int(s.extent.eval(st.env))
-            order = range(n - 1, -1, -1) if (getattr(st, 'reverse_affine', False) and s.kind == 'affine') else range(n)
-            for i in order:
-                st.env[s.var] = i
-                _exec(st, s.body)
-            st.env.pop(s.var, None)
-        elif isinstance(s, ir.Assign):
-            st.store(s.buf, st.idx(s.buf, s.idx), st.ev(s.rhs))
-        elif isinstance(s, ir.Reduce):
-            st.store(s.buf, st.idx(s.buf, s.idx), st.ev(s.rhs), accumulate=True)
-        elif isinstance(s, ir.Call):
-            _call(st, s)
-        else:
-            raise TypeError(s)
+        STMTS[type(s)](st, s)
 
 
-def _call(st: _State, c: ir.Call):
-    if c.instr in ("ns.sync.dma_copy", "ns.vector.tensor_copy", "ns.scalar.tensor_copy", "ns.gpsimd.tensor_copy"):
-        dst, src = c.arg("dst"), c.arg("src")
-        ds, ss = st.win(dst), st.win(src)
-        v = st.bufs[src.buf][ss]
-        if v.shape != st.bufs[dst.buf][ds].shape:
-            raise InterpError(f"{c.instr}: shape mismatch {v.shape} vs {st.bufs[dst.buf][ds].shape}")
-        if np.isnan(v).any():
-            raise InterpError(f"{c.instr}: copying uninitialised data from {src.buf}")
-        st.bufs[dst.buf][ds] = quantize(st.dtypes[dst.buf], v)
-        if dst.buf in st.fresh:
-            st.fresh[dst.buf][ds] = False
-    elif c.instr == "ns.tensor.matmul":
-        dst, sta, mov = c.arg("dst"), c.arg("stationary"), c.arg("moving")
-        ds = st.win(dst)
-        a = st.bufs[sta.buf][st.win(sta)]
-        b = st.bufs[mov.buf][st.win(mov)]
-        if np.isnan(a).any() or np.isnan(b).any():
-            raise InterpError("matmul operand reads uninitialised data")
-        prod = a.astype(np.float32).T @ b.astype(np.float32)
-        acc = c.attr("accumulate", None)
-        if prod.shape != st.bufs[dst.buf][ds].shape:
-            raise InterpError(f"matmul: result {prod.shape} vs dst {st.bufs[dst.buf][ds].shape}")
-        if acc is None:
-            fresh = st.fresh[dst.buf][ds]
-            if fresh.any() and not fresh.all():
-                raise InterpError("matmul accumulate=None onto a partially-written region")
-            cur = np.where(fresh, 0.0, st.bufs[dst.buf][ds])
-            st.bufs[dst.buf][ds] = (cur + prod).astype(np.float32)
-        elif acc is True:
-            if np.isnan(st.bufs[dst.buf][ds]).any():
-                raise InterpError("matmul accumulate=True onto uninitialised PSUM")
-            st.bufs[dst.buf][ds] = st.bufs[dst.buf][ds] + prod
-        else:
-            st.bufs[dst.buf][ds] = prod
+# ---------------------------------------------------------------- instructions
+def _copy(st: _State, c: ir.Call):
+    """dma_copy / tensor_copy on any engine: dst window = src window (cast to dst dtype)."""
+    dst, src = c.arg("dst"), c.arg("src")
+    ds, ss = st.win(dst), st.win(src)
+    v = st.bufs[src.buf][ss]
+    if v.shape != st.bufs[dst.buf][ds].shape:
+        raise InterpError(f"{c.instr}: shape mismatch {v.shape} vs {st.bufs[dst.buf][ds].shape}")
+    if np.isnan(v).any():
+        raise InterpError(f"{c.instr}: copying uninitialised data from {src.buf}")
+    st.bufs[dst.buf][ds] = quantize(st.dtypes[dst.buf], v)
+    if dst.buf in st.fresh:
         st.fresh[dst.buf][ds] = False
+
+
+def _matmul(st: _State, c: ir.Call):
+    """dst (+)= stationary.T @ moving, with nc_matmul's accumulate semantics:
+    None -> first write into a freshly allocated region overwrites, later writes add;
+    True -> add onto existing contents (must be initialised); False -> overwrite."""
+    dst, sta, mov = c.arg("dst"), c.arg("stationary"), c.arg("moving")
+    ds = st.win(dst)
+    a = st.bufs[sta.buf][st.win(sta)]
+    b = st.bufs[mov.buf][st.win(mov)]
+    if np.isnan(a).any() or np.isnan(b).any():
+        raise InterpError("matmul operand reads uninitialised data")
+    prod = a.astype(np.float32).T @ b.astype(np.float32)
+    acc = c.attr("accumulate", None)
+    cur_dst = st.bufs[dst.buf][ds]
+    if prod.shape != cur_dst.shape:
+        raise InterpError(f"matmul: result {prod.shape} vs dst {cur_dst.shape}")
+    if acc is None:
+        fresh = st.fresh[dst.buf][ds]
+        if fresh.any() and not fresh.all():
+            raise InterpError("matmul accumulate=None onto a partially-written region")
+        st.bufs[dst.buf][ds] = (np.where(fresh, 0.0, cur_dst) + prod).astype(np.float32)
+    elif acc is True:
+        if np.isnan(cur_dst).any():
+            raise InterpError("matmul accumulate=True onto uninitialised PSUM")
+        st.bufs[dst.buf][ds] = cur_dst + prod
     else:
-        raise InterpError(f"unknown instruction {c.instr}")
+        st.bufs[dst.buf][ds] = prod
+    st.fresh[dst.buf][ds] = False
+
+
+CALLS = {
+    "ns.sync.dma_copy": _copy,
+    "ns.vector.tensor_copy": _copy,
+    "ns.scalar.tensor_copy": _copy,
+    "ns.gpsimd.tensor_copy": _copy,
+    "ns.tensor.matmul": _matmul,
+}

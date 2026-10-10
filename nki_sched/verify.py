@@ -27,14 +27,15 @@ def hostile_inputs(shapes_by_arg: dict, seed=0, dtype="f32"):
     return out
 
 
-def torch_oracle(fn):
-    """Wrap a torch function as an oracle over numpy inputs (float32 storage)."""
+def torch_oracle(fn, arg_names=("lhsT", "rhs")):
+    """Wrap a torch function as an oracle over numpy inputs (float32 storage); arguments are taken
+    from the inputs dict in the order of arg_names."""
     import torch
 
     def run(inputs):
         dts = inputs.get("__dtypes__", {})
         tens = []
-        for name in ("lhsT", "rhs"):
+        for name in arg_names:
             t = torch.from_numpy(np.asarray(inputs[name], dtype=np.float32))
             if dts.get(name) == "bf16":
                 t = t.to(torch.bfloat16)

@@ -77,8 +77,6 @@ class Aff:
     def of(x) -> "Aff":
         if isinstance(x, Aff):
             return x
-        if isinstance(x, bool):
-            raise TypeError("bool is not an index expression")
         if isinstance(x, int):
             return Aff(x, ())
         if isinstance(x, (Var, Sym, FloorDiv, Mod, MinE, Prod)):

@@ -18,19 +18,6 @@ class HardwareConfig:
     psum_banks: int = 8  # [unverified]
     sbuf_bytes_per_partition: int = 192 * 1024  # [unverified]
 
-    # aliases used in SYNTAX.md
-    @property
-    def PMAX(self):
-        return self.pmax
-
-    @property
-    def GEMM_STATIONARY_FMAX(self):
-        return self.stationary_fmax
-
-    @property
-    def GEMM_MOVING_FMAX(self):
-        return self.moving_fmax
-
 
 NC_DEFAULT = HardwareConfig()
 # A tiny configuration so scalar-loop interpretation of whole schedules stays fast in tests.
