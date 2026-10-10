@@ -49,8 +49,8 @@ def test_set_memory_errors(tiled, buf, mem, message):
 
 
 def test_set_memory_enforces_hardware_rules_immediately(new_sched, tiled):
-    with pytest.raises(ScheduleError, match="non-constant shape"):
-        new_sched(check=False).set_memory("matmul", PSUM)        # still [M, N]
+    with pytest.raises(ScheduleError, match="not bounded"):
+        new_sched(check=False).set_memory("matmul", PSUM)        # still [M, N]: M is unbounded
     s = new_sched(check=False)       # M need not be divisible by 8 in the oracle's shapes
     s.split("C.m", 8, names=("mo", "mi"), perfect=True)
     s.split("C.n", 8, names=("no", "ni"), perfect=True)
@@ -138,7 +138,7 @@ def test_replace_matmul_builds_the_instruction_call_and_keeps_semantics(staged):
 
 
 @pytest.mark.parametrize("loop, instr, message", [
-    ("ko", "ns.tensor.matmul", "perfect 3-loop nest"),
+    ("ko", "ns.tensor.matmul", "must contain exactly one statement"),      # ko has several statements in its body
     ("ki", "ns.tensor.nope", "unknown instruction"),
     ("ki", "ns.vector.tensor_copy", "not a pure elementwise copy"),
 ])
@@ -147,12 +147,19 @@ def test_replace_errors(staged, loop, instr, message):
         staged().replace(loop, instr)
 
 
+def test_replace_rejects_a_nest_with_too_many_loops(new_sched):
+    s = new_sched(check=False)
+    s.split("matmul.k", 4, names=("ko", "ki"), perfect=True)          # matmul.m, matmul.n, ko, ki: four loops
+    with pytest.raises(ScheduleError, match="needs a nest of 3 loops, found 4"):
+        s.replace("matmul.m", "ns.tensor.matmul")
+
+
 def test_replace_matmul_rejects_a_stationary_operand_laid_out_the_wrong_way(new_sched):
     s = new_sched()
     red = ir.find_loop(s.proc.body, "matmul.k").body[0]
     swapped = ir.Reduce(red.buf, red.idx, ir.Mul(ir.Read("lhsT", tuple(reversed(red.rhs.a.idx))), red.rhs.b))
     s.proc = s.proc.with_(body=tuple(ir.map_stmts(s.proc.body, lambda st: swapped if st == red else None)))
-    with pytest.raises(ScheduleError, match="stationary operand must be laid out"):
+    with pytest.raises(ScheduleError, match="laid out transposed relative to what ns.tensor.matmul needs"):
         s.replace("matmul.m", "ns.tensor.matmul")
 
 

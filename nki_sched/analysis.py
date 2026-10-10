@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from . import ir
-from .expr import Aff, Var, FloorDiv, Mod, MinE, Prod
+from .expr import Aff, FloorDiv, MinE, Mod, Prod, Sym, Var
 
 
 class AnalysisError(Exception):
@@ -119,3 +119,45 @@ def dma_bytes(proc, sizes: dict, itemsize: int = 4) -> int:
         return total
 
     return rec(proc.body, 1)
+
+
+# ---------------------------------------------------------------- upper bounds on size expressions
+def bounds_of(proc) -> dict:
+    """{size symbol: max} from the program's Bound assumptions (`S <= 128`)."""
+    out = {}
+    for a in proc.assumptions:
+        if isinstance(a, ir.Bound) and len(a.expr.terms) == 1 and a.expr.const == 0:
+            atom, coef = a.expr.terms[0]
+            if isinstance(atom, Sym) and coef > 0:
+                out[atom.name] = min(out.get(atom.name, a.max // coef), a.max // coef)
+    return out
+
+
+def _atom_ub(atom, bounds):
+    if isinstance(atom, Sym):
+        return bounds.get(atom.name)
+    if isinstance(atom, FloorDiv):
+        ub = upper_bound(atom.num, bounds)
+        return None if ub is None else ub // atom.den
+    if isinstance(atom, Mod):
+        return atom.den - 1
+    if isinstance(atom, MinE):
+        known = [u for u in (upper_bound(atom.a, bounds), upper_bound(atom.b, bounds)) if u is not None]
+        return min(known) if known else None
+    if isinstance(atom, Prod):
+        ua, ub = upper_bound(atom.a, bounds), upper_bound(atom.b, bounds)
+        return None if ua is None or ub is None else ua * ub
+    return None  # loop variables are not sizes
+
+
+def upper_bound(e: Aff, bounds: dict):
+    """The largest value size expression `e` can take given `bounds` ({symbol: max}), or None if it is
+    unbounded. Sizes are non-negative, so atoms with a negative coefficient contribute at most 0."""
+    total = e.const
+    for atom, coef in e.terms:
+        if coef > 0:
+            ub = _atom_ub(atom, bounds)
+            if ub is None:
+                return None
+            total += coef * ub
+    return total

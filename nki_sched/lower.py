@@ -6,55 +6,55 @@ from __future__ import annotations
 from dataclasses import replace
 
 from . import ir
-from .analysis import AnalysisError, dim_interval, loop_ranges
+from .analysis import AnalysisError, bounds_of, dim_interval, loop_ranges
 from .expr import Aff, Var
-from .hw import DTYPE_BYTES, INSTRS, HardwareConfig
-
-
-class HardwareError(Exception):
-    pass
+from .hw import HardwareConfig, HardwareError, itemsize
+from .instrs import INSTRS, instr_upper_bound
 
 
 # ---------------------------------------------------------------- hardware legality
 def check_hw(proc: ir.Proc, hw: HardwareConfig):
+    """Reject programs that cannot run on the chip: on-chip tiles need a bounded partition dimension
+    <= pmax, PSUM tiles fit one bank, every instruction call has operands in the right memory spaces
+    and respects its own caps. Symbolic sizes are checked against the program's Bound assumptions."""
+    bounds = bounds_of(proc)
+    ub = instr_upper_bound(bounds)
     bufs = ir.buffers_of(proc)
     for b in bufs.values():
-        if b.mem in (ir.SBUF, ir.PSUM):
-            if not b.shape[0].is_const or (b.mem == ir.PSUM and not all(d.is_const for d in b.shape)):
-                raise HardwareError(f"{b.name} ({b.mem}) has a non-constant shape {[str(d) for d in b.shape]}; the partition dim (axis 0) of on-chip tiles must be static"
-                                    + (" and PSUM tiles fully static" if b.mem == ir.PSUM else ""))
-            p = b.shape[0].const
-            if p > hw.pmax:
-                raise HardwareError(f"{b.name} @ {b.mem}: partition dimension (axis 0) is {p} > {hw.pmax}; split the loop feeding it or fold axis 0")
+        if b.mem not in (ir.SBUF, ir.PSUM):
+            continue
+        p = ub(b.shape[0])
+        if p is None:
+            raise HardwareError(
+                f"{b.name} ({b.mem}): partition dim (axis 0) is {b.shape[0]}, which is not bounded; "
+                f"add a bound (e.g. s.bound('S', {hw.pmax})) or tile the loop that sets it")
+        if p > hw.pmax:
+            raise HardwareError(f"{b.name} @ {b.mem}: partition dimension (axis 0) is {b.shape[0]} (up to {p}) > {hw.pmax}; "
+                                f"split the loop feeding it or fold axis 0")
         if b.mem == ir.PSUM:
-            if b.dtype != "f32":
-                raise HardwareError(f"{b.name} @ PSUM must be f32 (matmul accumulators), got {b.dtype}")
             free = 1
             for d in b.shape[1:]:
-                free *= d.const
-            if free * DTYPE_BYTES["f32"] > hw.psum_bank_bytes:
-                raise HardwareError(f"{b.name} @ PSUM needs {free * 4} B/partition > one bank ({hw.psum_bank_bytes} B)")
+                u = ub(d)
+                if u is None:
+                    raise HardwareError(f"{b.name} @ PSUM: free dim {d} is not bounded; PSUM tiles must have a bounded size")
+                free *= u
+            if free * itemsize(b.dtype) > hw.psum_bank_bytes:
+                raise HardwareError(f"{b.name} @ PSUM needs {free * itemsize(b.dtype)} B/partition > one bank ({hw.psum_bank_bytes} B)")
     for s in ir.walk(proc.body):
-        if isinstance(s, ir.Call):
-            ins = INSTRS.get(s.instr)
-            if ins is None:
-                raise HardwareError(f"unknown instruction {s.instr}")
-            for role, w in s.args:
-                allowed = ins.mems[role]
-                if bufs[w.buf].mem not in allowed:
-                    raise HardwareError(f"{s.instr}: argument '{role}' ({w.buf}) is in {bufs[w.buf].mem}, must be in {allowed}")
-            if s.instr == "ns.tensor.matmul":
-                sta, mov, dst = (s.arg(r) for r in ("stationary", "moving", "dst"))
-                try:
-                    k, m = (z.const for z in sta.shape())
-                    k2, n = (z.const for z in mov.shape())
-                    dshape = tuple(z.const for z in dst.shape())
-                except (ValueError, AttributeError):
-                    raise HardwareError(f"{s.instr}: operand windows must be 2-D with constant sizes")
-                if k != k2 or dshape != (m, n):
-                    raise HardwareError(f"{s.instr}: inconsistent shapes stationary[{k},{m}] moving[{k2},{n}] dst{list(dshape)}")
-                if k > hw.pmax or m > hw.stationary_fmax or n > hw.moving_fmax:
-                    raise HardwareError(f"{s.instr}: tile k={k} m={m} n={n} exceeds caps ({hw.pmax}, {hw.stationary_fmax}, {hw.moving_fmax})")
+        if not isinstance(s, ir.Call):
+            continue
+        ins = INSTRS.get(s.instr)
+        if ins is None:
+            raise HardwareError(f"unknown instruction {s.instr}")
+        for role, w in s.args:
+            if bufs[w.buf].mem not in ins.mems[role]:
+                raise HardwareError(f"{s.instr}: argument '{role}' ({w.buf}) is in {bufs[w.buf].mem}, must be in {ins.mems[role]}")
+        if s.instr == "ns.tensor.matmul":
+            dst = bufs[s.arg("dst").buf]
+            if dst.dtype != "f32":
+                raise HardwareError(f"ns.tensor.matmul: dst ({dst.name}) must be f32 (PSUM accumulators), got {dst.dtype}")
+        if ins.check is not None:
+            ins.check(s, hw, ub)
 
 
 # ---------------------------------------------------------------- window of an affine loop nest access

@@ -26,29 +26,10 @@ NC_TINY = HardwareConfig(pmax=4, stationary_fmax=4, moving_fmax=8, psum_bank_byt
 DTYPE_BYTES = {"f32": 4, "bf16": 2, "f16": 2}
 
 
-@dataclass(frozen=True)
-class Instr:
-    name: str  # ns-level name: "ns.tensor.matmul"
-    engine: str  # tensor | vector | scalar | gpsimd | sync
-    nisa: str  # NKI function name: "nc_matmul"
-    roles: tuple  # argument roles in call order
-    mems: dict  # role -> required memory space (or tuple of allowed)
+class HardwareError(Exception):
+    """a program (or one instruction) violates a hardware rule"""
 
 
-INSTRS = {
-    "ns.tensor.matmul": Instr(
-        "ns.tensor.matmul", "tensor", "nc_matmul", ("dst", "stationary", "moving"),
-        {"dst": ("PSUM",), "stationary": ("SBUF",), "moving": ("SBUF",)},
-    ),
-    "ns.vector.tensor_copy": Instr(
-        "ns.vector.tensor_copy", "vector", "tensor_copy", ("dst", "src"),
-        {"dst": ("SBUF", "PSUM"), "src": ("SBUF", "PSUM")},
-    ),
-    "ns.sync.dma_copy": Instr(
-        "ns.sync.dma_copy", "sync", "dma_copy", ("dst", "src"),
-        {"dst": ("HBM", "SBUF"), "src": ("HBM", "SBUF")},
-    ),
-}
-
-# engines a copy-like instruction may be moved to by set_engine (NKI: tensor_copy/dma_copy take engine=)
-COPY_ENGINES = ("vector", "scalar", "gpsimd")
+def itemsize(dtype: str) -> int:
+    """bytes per element; dtypes that follow an input ("like:x") are sized for f32, the worst case"""
+    return DTYPE_BYTES.get(dtype, 4)

@@ -54,16 +54,37 @@ class Read:
     idx: tuple
 
 
+BIN_OPS = ("add", "sub", "mul", "div", "max")
+UN_OPS = ("neg", "exp", "recip")
+REDUCE_OPS = ("add", "max")
+
+
 @dataclass(frozen=True)
-class Mul:
+class Bin:
+    op: str  # one of BIN_OPS
     a: Any
     b: Any
 
 
 @dataclass(frozen=True)
-class Add:
+class Un:
+    op: str  # one of UN_OPS
     a: Any
-    b: Any
+
+
+def Mul(a, b):
+    return Bin("mul", a, b)
+
+
+def Add(a, b):
+    return Bin("add", a, b)
+
+
+@dataclass(frozen=True)
+class Param:
+    """a kernel-level scalar parameter (Proc.fparams), e.g. the attention scale"""
+
+    name: str
 
 
 @dataclass(frozen=True)
@@ -101,11 +122,12 @@ class Assign:
 
 @dataclass(frozen=True)
 class Reduce:
-    """buf[idx] += rhs"""
+    """buf[idx] = op(buf[idx], rhs); op "add" is `+=`, "max" is a running maximum"""
 
     buf: str
     idx: tuple
     rhs: Any
+    op: str = "add"
 
 
 @dataclass(frozen=True)
@@ -136,13 +158,26 @@ class Assumption:
 
 
 @dataclass(frozen=True)
+class Bound:
+    """`expr <= max`: an upper bound on a size, required to prove tile sizes fit (e.g. S <= 128);
+    the emitter turns it into an assert."""
+
+    expr: Aff
+    max: int
+
+    def __str__(self):
+        return f"{self.expr} <= {self.max}"
+
+
+@dataclass(frozen=True)
 class Proc:
     name: str
     args: tuple  # tuple[Buffer], role arg/out
     sizes: tuple  # ((sym, argname, dim), ...)  how to read each size symbol from an argument
     body: tuple
-    assumptions: tuple = ()
+    assumptions: tuple = ()  # Assumption | Bound
     params: tuple = ()  # ((name, Aff), ...) derived Python-level parameters (shape-dependent knobs)
+    fparams: tuple = ()  # ((name, scalar.S*), ...) floating-point kernel parameters, e.g. the attention scale
 
     def with_(self, **kw):
         return replace(self, **kw)
@@ -181,8 +216,10 @@ def loop_vars(stmts) -> list:
 def _map_expr(e, f):
     if isinstance(e, Read):
         return Read(e.buf, tuple(f(i) for i in e.idx))
-    if isinstance(e, (Mul, Add)):
-        return type(e)(_map_expr(e.a, f), _map_expr(e.b, f))
+    if isinstance(e, Bin):
+        return Bin(e.op, _map_expr(e.a, f), _map_expr(e.b, f))
+    if isinstance(e, Un):
+        return Un(e.op, _map_expr(e.a, f))
     if isinstance(e, CastE):
         return CastE(e.dtype, _map_expr(e.e, f))
     return e
@@ -195,7 +232,7 @@ def map_aff(s, f):
     if isinstance(s, Assign):
         return Assign(s.buf, tuple(f(i) for i in s.idx), _map_expr(s.rhs, f))
     if isinstance(s, Reduce):
-        return Reduce(s.buf, tuple(f(i) for i in s.idx), _map_expr(s.rhs, f))
+        return Reduce(s.buf, tuple(f(i) for i in s.idx), _map_expr(s.rhs, f), s.op)
     if isinstance(s, Alloc):
         return Alloc(s.buf.with_(shape=tuple(f(d) for d in s.buf.shape)))
     if isinstance(s, Call):
@@ -214,8 +251,10 @@ def subst_vars(s, m: dict):
 def _remap_expr(e, buf, new, f):
     if isinstance(e, Read):
         return Read(new, f(e.idx)) if e.buf == buf else e
-    if isinstance(e, (Mul, Add)):
-        return type(e)(_remap_expr(e.a, buf, new, f), _remap_expr(e.b, buf, new, f))
+    if isinstance(e, Bin):
+        return Bin(e.op, _remap_expr(e.a, buf, new, f), _remap_expr(e.b, buf, new, f))
+    if isinstance(e, Un):
+        return Un(e.op, _remap_expr(e.a, buf, new, f))
     if isinstance(e, CastE):
         return CastE(e.dtype, _remap_expr(e.e, buf, new, f))
     return e
@@ -231,7 +270,7 @@ def remap_buf(s, buf: str, new: str, f):
         return Assign(new, f(s.idx), rhs) if s.buf == buf else Assign(s.buf, s.idx, rhs)
     if isinstance(s, Reduce):
         rhs = _remap_expr(s.rhs, buf, new, f)
-        return Reduce(new, f(s.idx), rhs) if s.buf == buf else Reduce(s.buf, s.idx, rhs)
+        return Reduce(new, f(s.idx), rhs, s.op) if s.buf == buf else Reduce(s.buf, s.idx, rhs, s.op)
     if isinstance(s, Call):
         return Call(s.instr, tuple((r, Window(new, f(w.lo), w.size, w.points) if w.buf == buf else w) for r, w in s.args), s.attrs)
     return s
@@ -256,11 +295,11 @@ def map_stmts(stmts, f):
 def expr_reads(e) -> Iterator[Read]:
     if isinstance(e, Read):
         yield e
-    elif isinstance(e, (Mul, Add)):
+    elif isinstance(e, Bin):
         yield from expr_reads(e.a)
         yield from expr_reads(e.b)
-    elif isinstance(e, CastE):
-        yield from expr_reads(e.e)
+    elif isinstance(e, (Un, CastE)):
+        yield from expr_reads(e.a if isinstance(e, Un) else e.e)
 
 
 def accesses(s):
@@ -286,13 +325,23 @@ def accesses(s):
 
 
 # ---------------------------------------------------------------- printing
+def _p(e) -> str:
+    """operand of a binary operator: parenthesize nested binary expressions"""
+    return f"({_e(e)})" if isinstance(e, Bin) and e.op != "max" else _e(e)
+
+
 def _e(e) -> str:
     if isinstance(e, Read):
         return f"{e.buf}[{', '.join(str(i) for i in e.idx)}]"
-    if isinstance(e, Mul):
-        return f"{_e(e.a)} * {_e(e.b)}"
-    if isinstance(e, Add):
-        return f"{_e(e.a)} + {_e(e.b)}"
+    if isinstance(e, Bin):
+        if e.op == "max":
+            return f"max({_e(e.a)}, {_e(e.b)})"
+        sym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[e.op]
+        return f"{_p(e.a)} {sym} {_p(e.b)}"
+    if isinstance(e, Un):
+        return f"{e.op}({_e(e.a)})"
+    if isinstance(e, Param):
+        return e.name
     if isinstance(e, CastE):
         return f"cast_{e.dtype}({_e(e.e)})"
     if isinstance(e, Lit):
@@ -323,7 +372,8 @@ def fmt(stmts, ind=0) -> str:
         elif isinstance(s, Assign):
             lines.append(f"{pad}{s.buf}[{', '.join(str(i) for i in s.idx)}] = {_e(s.rhs)}")
         elif isinstance(s, Reduce):
-            lines.append(f"{pad}{s.buf}[{', '.join(str(i) for i in s.idx)}] += {_e(s.rhs)}")
+            op = "+=" if s.op == "add" else f"{s.op}="
+            lines.append(f"{pad}{s.buf}[{', '.join(str(i) for i in s.idx)}] {op} {_e(s.rhs)}")
         elif isinstance(s, Call):
             args = ", ".join(f"{r}={_w(w)}" for r, w in s.args)
             attrs = "".join(f", {k}={v}" for k, v in s.attrs)
@@ -337,6 +387,8 @@ def fmt_proc(p: Proc) -> str:
     head = f"proc {p.name}({', '.join(b.name + ': ' + b.dtype + '[' + ', '.join(str(d) for d in b.shape) + ']' for b in p.args)})"
     if p.assumptions:
         head += "\n  assume " + "; ".join(str(a) for a in p.assumptions)
+    if p.fparams:
+        head += "\n  scalars " + "; ".join(f"{n} = {e}" for n, e in p.fparams)
     return head + "\n" + fmt(p.body, 1)
 
 

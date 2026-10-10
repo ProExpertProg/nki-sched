@@ -13,8 +13,10 @@ from . import ir
 from .analysis import AnalysisError, const_int, injective, loop_ranges, region
 from .emit import emit_nki
 from .expr import Aff, Var, var
-from .hw import INSTRS, NC_DEFAULT, HardwareConfig
-from .lower import HardwareError, check_hw, copy_nest_to_call, infer_kinds, nest_window
+from .hw import NC_DEFAULT, HardwareConfig, HardwareError
+from .instrs import INSTRS
+from .lower import check_hw, copy_nest_to_call, infer_kinds, nest_window
+from .match import MatchError, match_instr
 
 
 class ScheduleError(Exception):
@@ -367,57 +369,69 @@ class Sched:
 
     # ------------------------------------------------------------------ instruction selection
     def replace(self, loop: str, instr: str):
-        """Tensorize: replace the loop nest rooted at `loop` by an ns instruction call when the
-        nest matches the instruction's semantics (structural unification)."""
-        if instr not in INSTRS:
+        """Tensorize: replace the loop nest rooted at `loop` by an ns instruction when the nest matches
+        the instruction's semantics (see `instrs.INSTRS`). An instruction that overwrites its output
+        (the reductions) also consumes the initialisation nest directly in front of the loop."""
+        ins = INSTRS.get(instr)
+        if ins is None:
             raise ScheduleError(f"unknown instruction {instr}; known: {list(INSTRS)}")
         l = self._find(loop)
-        bufs = ir.buffers_of(self.proc)
-        if instr == "ns.tensor.matmul":
-            call = self._match_matmul(l)
-        else:
-            call = copy_nest_to_call(l, bufs)
+        chain = _chain(l)
+        init_value, out_window = None, None
+        if ins.pattern is None:
+            call = copy_nest_to_call(l, ir.buffers_of(self.proc))
             if call is None or call.instr != instr:
                 raise ScheduleError(f"replace({loop}, {instr}): the nest is not a pure elementwise copy between compatible memories")
-        p = self._rewrite_loop(loop, lambda f: (call,))
-        self._commit(f"replace({loop}, {instr})", p)
+        else:
+            body = chain[-1].body
+            if len(body) != 1 or not isinstance(body[0], (ir.Assign, ir.Reduce)):
+                raise ScheduleError(f"replace({loop}, {instr}): the innermost loop '{chain[-1].var}' must contain exactly one statement")
+            try:
+                m = match_instr(ins, chain, body[0])
+            except MatchError as e:
+                raise ScheduleError(f"replace({loop}, {instr}): {e}") from None
+            call, init_value, out_window = m.call, ins.pattern.init, m.out_window
 
-    def _match_matmul(self, l: ir.For) -> ir.Call:
-        chain = _chain(l)
-        if len(chain) != 3 or len(chain[-1].body) != 1 or not isinstance(chain[-1].body[0], ir.Reduce):
-            raise ScheduleError(f"replace(ns.tensor.matmul): '{l.var}' must root a perfect 3-loop nest around a single `+=`")
-        red = chain[-1].body[0]
-        if not (isinstance(red.rhs, ir.Mul) and isinstance(red.rhs.a, ir.Read) and isinstance(red.rhs.b, ir.Read)):
-            raise ScheduleError("replace(ns.tensor.matmul): the update must be dst[m,n] += a[k,m] * b[k,n]")
-        a, b = red.rhs.a, red.rhs.b
-        ext = {c.var: c.extent for c in chain}
-        vs = set(ext)
+        def rec(stmts):
+            out = []
+            for st in stmts:
+                if isinstance(st, ir.For):
+                    if st.var == loop:
+                        if init_value is not None:
+                            if not (out and self._is_init_nest(out[-1], out_window, init_value)):
+                                raise ScheduleError(
+                                    f"replace({loop}, {instr}): the statement in front of the nest must initialise "
+                                    f"{out_window.buf} to {init_value} over the whole output window (the instruction overwrites it)")
+                            out.pop()
+                        out.append(call)
+                        continue
+                    st = replace(st, body=tuple(rec(st.body)))
+                out.append(st)
+            return out
 
-        def vars_in(idx):
-            return {v for v in vs if any(v in e.free_vars() for e in idx)}
+        self._commit(f"replace({loop}, {instr})", self.proc.with_(body=tuple(rec(self.proc.body))))
 
-        dv, av, bv = vars_in(red.idx), vars_in(a.idx), vars_in(b.idx)
-        ks = av & bv - dv
-        ms = dv & av - bv
-        ns_ = dv & bv - av
-        if len(ks) != 1 or len(ms) != 1 or len(ns_) != 1:
-            raise ScheduleError("replace(ns.tensor.matmul): cannot identify (k, m, n) loops from the access pattern")
-        k, m, n = next(iter(ks)), next(iter(ms)), next(iter(ns_))
-        wd, vd = nest_window(red.buf, red.idx, {m: ext[m], n: ext[n]})
-        wa, va = nest_window(a.buf, a.idx, {k: ext[k], m: ext[m]})
-        wb, vb = nest_window(b.buf, b.idx, {k: ext[k], n: ext[n]})
-        if wd is None or wa is None or wb is None:
-            raise ScheduleError("replace(ns.tensor.matmul): operand indices must be plain loop variables (plus offsets)")
-        if [x for x in vd if x] != [m, n]:
-            raise ScheduleError(f"replace(ns.tensor.matmul): dst must be indexed [m, n], found order {vd}")
-        if [x for x in va if x] != [k, m]:
-            raise ScheduleError(f"replace(ns.tensor.matmul): stationary operand must be laid out [k, m] (contraction on the partition axis); found {va}. "
-                                f"Stage a transposed copy of '{a.buf}' first.")
-        if [x for x in vb if x] != [k, n]:
-            raise ScheduleError(f"replace(ns.tensor.matmul): moving operand must be laid out [k, n]; found {vb}")
-        for v in (k, m, n):
-            const_int(ext[v], f"extent of {v}")
-        return ir.Call("ns.tensor.matmul", (("dst", wd), ("stationary", wa), ("moving", wb)), (("accumulate", True),))
+    @staticmethod
+    def _is_init_nest(stmt, window: ir.Window, value: float) -> bool:
+        """is `stmt` a perfect nest that stores `value` over exactly `window`?"""
+        if not isinstance(stmt, ir.For):
+            return False
+        ch = _chain(stmt)
+        inner = ch[-1].body
+        if len(inner) != 1 or not isinstance(inner[0], ir.Assign) or inner[0].rhs != ir.Lit(value) or inner[0].buf != window.buf:
+            return False
+        w, _ = nest_window(window.buf, inner[0].idx, {c.var: c.extent for c in ch})
+        return w is not None and w.lo == window.lo and w.size == window.size
+
+    def bound(self, size: str, max: int):
+        """Assume the size symbol `size` is at most `max`; the emitted kernel asserts it. This is what
+        lets a symbolic extent (e.g. the sequence length S) be proven to fit a 128-partition tile."""
+        if size not in {n for n, _, _ in self.proc.sizes}:
+            raise ScheduleError(f"bound: unknown size '{size}'. Sizes: {[n for n, _, _ in self.proc.sizes]}")
+        new = ir.Bound(Aff.of(size), int(max))
+        if new in self.proc.assumptions:
+            return
+        self._commit(f"bound({size} <= {max})", self.proc.with_(assumptions=self.proc.assumptions + (new,)))
 
     def fold_init(self, buf: str):
         """Drop the zero-initialisation nest of an accumulator: the first matmul into a freshly

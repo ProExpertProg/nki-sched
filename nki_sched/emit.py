@@ -7,7 +7,8 @@ import re
 
 from . import ir
 from .expr import Aff, to_py
-from .hw import INSTRS, NC_DEFAULT, HardwareConfig
+from .hw import NC_DEFAULT, HardwareConfig
+from .instrs import INSTRS
 from .lower import check_hw, infer_kinds, select_copies
 
 
@@ -63,6 +64,19 @@ def sbuf_footprint(proc: ir.Proc) -> Aff:
     return total
 
 
+def _attr_src(key: str, value):
+    """source text of a call attribute: matched scalars are float literals or kernel parameters"""
+    if value is None:
+        return None
+    if key == "engine":
+        return f"nisa.{value}_engine"
+    if isinstance(value, ir.Param):
+        return ident(value.name)
+    if isinstance(value, float):
+        return repr(value)
+    return str(value)
+
+
 def emit_nki(proc: ir.Proc, hw: HardwareConfig = NC_DEFAULT) -> str:
     """Finalize (copy selection, loop-kind inference, hardware legality) and print NKI source."""
     proc = select_copies(proc)
@@ -87,7 +101,12 @@ def emit_nki(proc: ir.Proc, hw: HardwareConfig = NC_DEFAULT) -> str:
     for name, e in proc.params:
         lines.append(f"{ind}{ident(name)} = {aff(e)}")
     for a in proc.assumptions:
-        lines.append(f'{ind}assert {aff(a.expr)} % {a.mod} == 0, "expected {a.expr} to be a multiple of {a.mod}"')
+        if isinstance(a, ir.Bound):
+            lines.append(f'{ind}assert {aff(a.expr)} <= {a.max}, "expected {a.expr} to be at most {a.max}"')
+        else:
+            lines.append(f'{ind}assert {aff(a.expr)} % {a.mod} == 0, "expected {a.expr} to be a multiple of {a.mod}"')
+    for name, e in proc.fparams:
+        lines.append(f"{ind}{ident(name)} = {e.to_py(ident)}")
     foot = sbuf_footprint(proc)
     if foot.is_const:
         if foot.const > hw.sbuf_bytes_per_partition:
@@ -112,14 +131,9 @@ def emit_nki(proc: ir.Proc, hw: HardwareConfig = NC_DEFAULT) -> str:
                 emit(s.body, depth + 1)
             elif isinstance(s, ir.Call):
                 ins = INSTRS[s.instr]
-                kw = ", ".join(f"{r}={window_src(s.arg(r), bufs)}" for r in ins.roles)
-                extra = ""
-                for k, v in s.attrs:
-                    if k == "accumulate" and v is not None:
-                        extra += f", accumulate={v}"
-                    elif k == "engine":
-                        extra += f", engine=nisa.{v}_engine"
-                lines.append(f"{pad}nisa.{ins.nisa}({kw}{extra})")
+                srcs = {r: window_src(s.arg(r), bufs) for r in ins.roles}
+                attrs = {k: _attr_src(k, v) for k, v in s.attrs}
+                lines.append(f"{pad}{ins.emit(ins, srcs, attrs)}")
             else:
                 raise EmitError(
                     f"scalar statement left in the program ({type(s).__name__} on {s.buf}); every loop nest must be "

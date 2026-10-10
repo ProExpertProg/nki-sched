@@ -24,7 +24,6 @@ def win(name, *shape):
 @pytest.mark.parametrize("alloc, hw, message", [
     (buf("t", 129, 8, mem=ir.SBUF), NC_DEFAULT, "partition dimension"),
     (buf("t", 8, 8, mem=ir.SBUF), NC_TINY, "partition dimension"),            # tiny config: pmax = 4
-    (buf("t", 128, 8, mem=ir.PSUM, dtype="bf16"), NC_DEFAULT, "must be f32"),
     (buf("t", 128, 513, mem=ir.PSUM), NC_DEFAULT, "one bank"),                 # 513 * 4 B > 2 KiB
 ])
 def test_check_hw_rejects(alloc, hw, message):
@@ -32,25 +31,32 @@ def test_check_hw_rejects(alloc, hw, message):
         check_hw(prog(ir.Alloc(alloc)), hw)
 
 
-@pytest.mark.parametrize("alloc", [buf("t", 128, 512, mem=ir.PSUM), buf("t", 128, 4096, mem=ir.SBUF), buf("t", 1000, 7)])
+@pytest.mark.parametrize("alloc", [
+    buf("t", 128, 512, mem=ir.PSUM), buf("t", 128, 4096, mem=ir.SBUF), buf("t", 1000, 7),
+    buf("t", 128, 1024, mem=ir.PSUM, dtype="bf16"),   # a bf16 PSUM tile is fine by itself (e.g. a transpose output)
+])
 def test_check_hw_accepts(alloc):
     check_hw(prog(ir.Alloc(alloc)), NC_DEFAULT)
 
 
-def test_check_hw_requires_static_partition_dim_but_allows_symbolic_free_dims_in_sbuf():
+def test_symbolic_partition_dim_needs_a_bound_and_symbolic_free_dims_are_fine_in_sbuf():
     from nki_sched.expr import sym
     sym_free = ir.Buffer("t", (A(128), sym("K") // 128), "f32", ir.SBUF)
     check_hw(prog(ir.Alloc(sym_free)), NC_DEFAULT)
-    sym_part = ir.Buffer("t", (sym("K"), A(8)), "f32", ir.SBUF)
-    with pytest.raises(HardwareError, match="partition dim"):
-        check_hw(prog(ir.Alloc(sym_part)), NC_DEFAULT)
-    sym_psum = ir.Buffer("t", (A(128), sym("N")), "f32", ir.PSUM)
-    with pytest.raises(HardwareError, match="fully static"):
-        check_hw(prog(ir.Alloc(sym_psum)), NC_DEFAULT)
+    sym_part = prog(ir.Alloc(ir.Buffer("t", (sym("S"), A(8)), "f32", ir.SBUF)))
+    with pytest.raises(HardwareError, match="not bounded"):
+        check_hw(sym_part, NC_DEFAULT)
+    check_hw(sym_part.with_(assumptions=(ir.Bound(sym("S"), 128),)), NC_DEFAULT)                 # S <= 128: legal
+    with pytest.raises(HardwareError, match="partition dimension"):
+        check_hw(sym_part.with_(assumptions=(ir.Bound(sym("S"), 129),)), NC_DEFAULT)             # S <= 129: not provable
+    sym_psum = prog(ir.Alloc(ir.Buffer("t", (A(128), sym("N")), "f32", ir.PSUM)))
+    with pytest.raises(HardwareError, match="not bounded"):
+        check_hw(sym_psum, NC_DEFAULT)
+    check_hw(sym_psum.with_(assumptions=(ir.Bound(sym("N"), 512),)), NC_DEFAULT)                 # N <= 512 f32 fits one bank
 
 
-def mm_call(dst_mem=ir.PSUM, st_mem=ir.SBUF, mv_mem=ir.SBUF, k=128, m=128, n=512, k2=None):
-    allocs = (ir.Alloc(buf("d", m, n, mem=dst_mem)), ir.Alloc(buf("s", k, m, mem=st_mem)), ir.Alloc(buf("v", k2 or k, n, mem=mv_mem)))
+def mm_call(dst_mem=ir.PSUM, st_mem=ir.SBUF, mv_mem=ir.SBUF, k=128, m=128, n=512, k2=None, dst_dtype="f32"):
+    allocs = (ir.Alloc(buf("d", m, n, mem=dst_mem, dtype=dst_dtype)), ir.Alloc(buf("s", k, m, mem=st_mem)), ir.Alloc(buf("v", k2 or k, n, mem=mv_mem)))
     call = ir.Call("ns.tensor.matmul", (("dst", win("d", m, n)), ("stationary", win("s", k, m)), ("moving", win("v", k2 or k, n))))
     return prog(*allocs, call)
 
@@ -66,6 +72,7 @@ def test_check_hw_accepts_a_legal_matmul():
     (dict(n=512), HardwareConfig(moving_fmax=256), "exceeds caps"),      # so the matmul rule is what fires
     (dict(k=129), NC_DEFAULT, "partition dimension"),                    # buffer rule fires first
     (dict(k2=64), NC_DEFAULT, "inconsistent shapes"),
+    (dict(dst_dtype="bf16"), NC_DEFAULT, "dst .* must be f32"),
 ])
 def test_check_hw_rejects_illegal_matmul(kw, hw, message):
     with pytest.raises(HardwareError, match=message):

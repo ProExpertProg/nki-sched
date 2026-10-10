@@ -34,6 +34,10 @@ class InterpError(Exception):
     pass
 
 
+BIN = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "div": np.divide, "max": np.maximum}
+UN = {"neg": np.negative, "exp": np.exp, "recip": lambda x: np.float32(1.0) / x}
+
+
 class _State:
     def __init__(self, proc: ir.Proc, inputs: dict):
         self.proc = proc
@@ -55,8 +59,12 @@ class _State:
             self.env[sym] = int(np.asarray(inputs[argname]).shape[dim])
         for name, expr in proc.params:
             self.env[name] = expr.eval(self.env)
+        self.fparams = {name: e.eval(self.env) for name, e in proc.fparams}
         for a in proc.assumptions:
-            if a.expr.eval(self.env) % a.mod != 0:
+            if isinstance(a, ir.Bound):
+                if a.expr.eval(self.env) > a.max:
+                    raise InterpError(f"assumption violated: {a}")
+            elif a.expr.eval(self.env) % a.mod != 0:
                 raise InterpError(f"assumption violated: {a}")
         for b in proc.args:
             if b.role == "arg":
@@ -101,23 +109,25 @@ class _State:
             if np.isnan(v):
                 raise InterpError(f"read of uninitialised {e.buf}[{e.idx}]")
             return v
-        if isinstance(e, ir.Mul):
-            return np.float32(self.ev(e.a) * self.ev(e.b))
-        if isinstance(e, ir.Add):
-            return np.float32(self.ev(e.a) + self.ev(e.b))
+        if isinstance(e, ir.Bin):
+            return np.float32(BIN[e.op](self.ev(e.a), self.ev(e.b)))
+        if isinstance(e, ir.Un):
+            return np.float32(UN[e.op](self.ev(e.a)))
+        if isinstance(e, ir.Param):
+            return np.float32(self.fparams[e.name])
         if isinstance(e, ir.CastE):
             return quantize(self.resolve_dtype(e.dtype), np.float32(self.ev(e.e)))
         if isinstance(e, ir.Lit):
             return np.float32(e.value)
         raise TypeError(e)
 
-    def store(self, buf, t, v, accumulate=False):
+    def store(self, buf, t, v, accumulate=False, op="add"):
         dt = self.dtypes[buf]
         arr = self.bufs[buf]
         if accumulate:
             if np.isnan(arr[t]):
                 raise InterpError(f"accumulate into uninitialised {buf}{t}")
-            v = arr[t] + v
+            v = BIN[op](arr[t], v)
         arr[t] = quantize(dt, np.float32(v))
         if buf in self.fresh:
             self.fresh[buf][t] = False
@@ -164,7 +174,7 @@ def _exec_assign(st: _State, s: ir.Assign):
 
 
 def _exec_reduce(st: _State, s: ir.Reduce):
-    st.store(s.buf, st.idx(s.buf, s.idx), st.ev(s.rhs), accumulate=True)
+    st.store(s.buf, st.idx(s.buf, s.idx), st.ev(s.rhs), accumulate=True, op=s.op)
 
 
 def _exec_call(st: _State, c: ir.Call):
@@ -233,10 +243,70 @@ def _matmul(st: _State, c: ir.Call):
     st.fresh[dst.buf][ds] = False
 
 
+def _read(st: _State, c: ir.Call, role: str) -> np.ndarray:
+    w = c.arg(role)
+    v = st.bufs[w.buf][st.win(w)]
+    if np.isnan(v).any():
+        raise InterpError(f"{c.instr}: operand '{role}' ({w.buf}) reads uninitialised data")
+    return v
+
+
+def _write(st: _State, c: ir.Call, value: np.ndarray):
+    w = c.arg("dst")
+    ds = st.win(w)
+    cur = st.bufs[w.buf][ds]
+    value = np.asarray(value, dtype=np.float32)
+    if value.shape != cur.shape:
+        raise InterpError(f"{c.instr}: result {value.shape} does not fit dst {cur.shape}")
+    st.bufs[w.buf][ds] = quantize(st.dtypes[w.buf], value)
+    st.fresh[w.buf][ds] = False
+
+
+def _elementwise(fn):
+    def handler(st: _State, c: ir.Call):
+        _write(st, c, fn(_read(st, c, "src")))
+
+    return handler
+
+
+def _reduce(fn):
+    """free-axis reduction of a [P, F] tile into a [P, 1] tile (nisa.tensor_reduce, axis=1)"""
+
+    def handler(st: _State, c: ir.Call):
+        _write(st, c, fn(_read(st, c, "src"), axis=1, keepdims=True))
+
+    return handler
+
+
+def _scalar_value(st: _State, v):
+    return st.fparams[v.name] if isinstance(v, ir.Param) else float(v)
+
+
+def _scale(st: _State, c: ir.Call):
+    _write(st, c, _read(st, c, "src") * np.float32(_scalar_value(st, c.attr("c"))))
+
+
+def _scale_rows(st: _State, c: ir.Call):
+    _write(st, c, _read(st, c, "src") * _read(st, c, "vec"))
+
+
+def _exp_bias(st: _State, c: ir.Call):
+    _write(st, c, np.exp(_read(st, c, "src") + _read(st, c, "bias")))
+
+
 CALLS = {
     "ns.sync.dma_copy": _copy,
     "ns.vector.tensor_copy": _copy,
     "ns.scalar.tensor_copy": _copy,
     "ns.gpsimd.tensor_copy": _copy,
     "ns.tensor.matmul": _matmul,
+    "ns.tensor.transpose": _elementwise(np.transpose),
+    "ns.vector.reduce_max": _reduce(np.max),
+    "ns.vector.reduce_sum": _reduce(np.sum),
+    "ns.vector.scale": _scale,
+    "ns.vector.scale_rows": _scale_rows,
+    "ns.vector.negate": _elementwise(np.negative),
+    "ns.vector.reciprocal": _elementwise(lambda x: np.float32(1.0) / x),
+    "ns.scalar.exp": _elementwise(np.exp),
+    "ns.scalar.exp_bias": _exp_bias,
 }
