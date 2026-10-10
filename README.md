@@ -10,6 +10,7 @@ See `PLAN.md` section 13 for exactly what was verified and what was not.
 * [`PLAN.md`](PLAN.md): architecture, IR, lowering, correctness strategy, MLIR decision, roadmap, status
 * [`SYNTAX.md`](SYNTAX.md): schedule-language draft and the worked matmul schedules
 * [`docs/PRIOR_ART.md`](docs/PRIOR_ART.md): Halide / TVM / Exo digest
+* [`AGENT.md`](AGENT.md): concise description of the schedule language, meant to be fed into a kernel agent's context (used by `agent_sched.py` in trainium-agent-labs `projects/02-kernel-agent`)
 
 ```
 python -m pytest tests                       # needs numpy; torch for the frontend tests
