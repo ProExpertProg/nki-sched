@@ -5,6 +5,10 @@ the value matmul); a schedule then places every stage on the chip. Two schedules
 
   single_tile   S, D <= 128: every stage is one hardware instruction on one tile. This is what the
                 nkibench attention level checks (seq 64/96/128, dim 32/64/128 with one kernel).
+  tiled         S a multiple of 128, D <= 128: 128 query rows at a time. The scores, softmax and value
+                matmul of a query tile are computed in turn (compute_at), the key axis in chunks of 128
+                (the transposes are 128x128 at most) and the value matmul accumulates over key chunks in
+                PSUM. Softmax is exact (the whole [128, S] row is in SBUF), not the online/flash variant.
 
     python examples/attention.py            # prints the IR and the NKI kernel of each example
 """
@@ -71,11 +75,59 @@ def single_tile(s: Sched, hw: HardwareConfig):
     # the PSUM -> SBUF copy of the result (O_sb = matmul_1) is recognised as a copy at emission
 
 
+def tiled(s: Sched, hw: HardwareConfig):
+    """S a multiple of pmax, D <= pmax. Per tile of pmax query rows: scores in key chunks of pmax, softmax
+    over the whole row, then O accumulated over key chunks."""
+    s.bound("D", hw.pmax)
+    s.recip_divisor("div")
+    s.recip_divisor("softmax")
+
+    # --- tile the queries, then compute the whole chain per query tile (last stage first)
+    qo, qi = s.split("O.s", hw.pmax, names=("qo", "qi"), perfect=True)
+    for stage in ("matmul_1", "softmax", "softmax_sum_rcp", "softmax_sum", "softmax_exp", "softmax_neg", "softmax_max", "div"):
+        s.compute_at(stage, at=qo)
+
+    # --- scores in key chunks of pmax: a chunk of K^T needs a 128x128 transpose at most
+    kc, kci = s.split("div.s1", hw.pmax, names=("kc", "kci"), perfect=True)
+    s.reorder(kc, "div.s", kci)
+    s.compute_at("matmul", at=kc)
+
+    # --- value matmul: contract over the keys in chunks of pmax, accumulating in PSUM
+    vo, vi = s.split("matmul_1.s1", hw.pmax, names=("vo", "vi"), perfect=True)
+    s.reorder(vo, vi, "matmul_1.s", "matmul_1.d")
+
+    for buf in ("div", "softmax_max", "softmax_neg", "softmax_exp", "softmax_sum", "softmax_sum_rcp", "softmax"):
+        s.set_memory(buf, SBUF)
+    s.set_memory("matmul", PSUM)
+    s.set_memory("matmul_1", PSUM)
+
+    s.stage_in("q", qo, SBUF, "q_sb")
+    s.stage_transposed("q_sb", "qT", at=qo)
+    s.stage_in("k", kc, SBUF, "k_sb")
+    s.stage_transposed("k_sb", "kT", at=kc)
+    s.stage_in("v", vo, SBUF, "v_sb")
+    s.stage_transposed("softmax", "pT", at=vo)
+    s.stage_out("O", qo, SBUF, "O_sb")
+
+    s.replace("matmul.s", "ns.tensor.matmul")
+    s.fold_init("matmul")
+    s.replace("div.s", "ns.vector.scale")
+    s.replace("softmax_max.s", "ns.vector.reduce_max")
+    s.replace("softmax_neg.s", "ns.vector.negate")
+    s.replace("softmax_exp.s", "ns.scalar.exp_bias")
+    s.replace("softmax_sum.s", "ns.vector.reduce_sum")
+    s.replace("softmax_sum_rcp.d0", "ns.vector.reciprocal")
+    s.replace("softmax.s", "ns.vector.scale_rows")
+    s.replace(vi, "ns.tensor.matmul")
+    s.fold_init("matmul_1")
+
+
 def main():
-    c.banner(single_tile)
-    s = new_attention_sched()
-    single_tile(s, s.hw)
-    c.show(s)
+    for schedule in (single_tile, tiled):
+        c.banner(schedule)
+        s = new_attention_sched()
+        schedule(s, s.hw)
+        c.show(s)
 
 
 if __name__ == "__main__":

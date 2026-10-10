@@ -200,6 +200,9 @@ class _Builder:
         row max (so exp cannot overflow), exponentiate, divide by the row sum."""
         if len(x.shape) != 2:
             raise TraceError("softmax is only supported on 2-D values")
+        if res_dt != "f32":
+            raise TraceError(f"softmax is only supported for float32 (got {res_dt}): the hardware needs float32 row statistics and an "
+                             f"explicit cast of the probabilities before the next matmul, which this frontend does not generate yet")
         mx, ng = self.unique(f"{name}_max"), self.unique(f"{name}_neg")
         ex, sm, out = self.unique(f"{name}_exp"), self.unique(f"{name}_sum"), self.unique(name)
         R, C = x.shape

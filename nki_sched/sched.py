@@ -254,8 +254,15 @@ class Sched:
             widx = next(iter(widx))
             mapping, ext_of = {}, {}
             for d, e in enumerate(widx):
+                if e.is_const:
+                    # a constant dim, e.g. the reduced dim of a [S, 1] row statistic: the consumers must read that element
+                    if lo[d] != e or size[d] != Aff(1):
+                        raise ScheduleError(f"compute_at: '{stage}' is written at constant index {e} in dim {d}, but the consumers inside "
+                                            f"'{at}' read the window [{lo[d]}, +{size[d]}) there")
+                    continue
                 if len(e.terms) != 1 or e.const != 0 or e.terms[0][1] != 1 or not isinstance(e.terms[0][0], Var):
-                    raise ScheduleError(f"compute_at: producer write index {[str(x) for x in widx]} must be a plain loop variable per dim")
+                    raise ScheduleError(f"compute_at: producer write index {[str(x) for x in widx]} must be a plain loop variable "
+                                        f"(or a constant) per dim")
                 v = e.terms[0][0].name
                 mapping[v] = lo[d] + var(v)
                 ext_of[v] = size[d]
