@@ -99,23 +99,39 @@ def main(argv=None) -> int:
 
 
 def _compile_only(kernel, op, shapes, dtypes, dnames) -> int:
-    """compile with neuronx-cc through the standalone-kernel path with a no-op executor"""
+    """Compile through the whole pipeline -- NKI front end, MLIR verification, BIR, then neuronx-cc to a NEFF --
+    but never run it. The executor is handed the compiled kernel *after* the NEFF exists; it records the NEFF's size
+    and the neuronx-cc time, and a case only counts as compiling if a non-empty NEFF was produced."""
     from nki.framework.compiled import StandaloneKernel
 
     sk = kernel._to_subclass(StandaloneKernel)
-    object.__setattr__(sk, "_executor", lambda compiled, exec_inputs, output_arrays: None)  # compile only, never run
+    seen = {}
+
+    def observe(compiled, exec_inputs, output_arrays):  # compile only, never run
+        seen["neff_bytes"] = os.path.getsize(compiled.neff_path) if os.path.exists(compiled.neff_path) else 0
+        seen["neuronx_cc_s"] = compiled.neuronx_cc_time
+
+    object.__setattr__(sk, "_executor", observe)
     bad = 0
     for dname in dnames:
         for shape in shapes:
             _, args, _ = make_cases(op, shape, dtypes[dname])[0]
+            label = f"{dname:5s} {'x'.join(map(str, shape)):>13s}"
+            seen.clear()
             t0 = time.perf_counter()
             try:
                 sk(*args)
-                print(f"{dname:5s} {'x'.join(map(str, shape)):>13s} COMPILES ({time.perf_counter() - t0:.1f}s)", flush=True)
             except Exception as e:  # noqa: BLE001
                 msg = [l.strip() for l in str(e).splitlines() if "error" in l.lower()]
-                print(f"{dname:5s} {'x'.join(map(str, shape)):>13s} COMPILE FAILED: {' | '.join(msg)[:300] or str(e)[:300]}", flush=True)
+                print(f"{label} COMPILE FAILED: {' | '.join(msg)[:300] or str(e)[:300]}", flush=True)
                 bad += 1
+                continue
+            if not seen.get("neff_bytes"):
+                print(f"{label} NO NEFF PRODUCED (the front end accepted the kernel but neuronx-cc output is missing)", flush=True)
+                bad += 1
+                continue
+            print(f"{label} COMPILES: NEFF {seen['neff_bytes'] / 1024:.0f} KiB, neuronx-cc {seen['neuronx_cc_s']:.1f}s "
+                  f"(total {time.perf_counter() - t0:.1f}s)", flush=True)
     return 1 if bad else 0
 
 

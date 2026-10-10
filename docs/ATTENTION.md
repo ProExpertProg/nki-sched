@@ -261,7 +261,7 @@ def nki_attention_(q, k, v):
 |---|---|---|
 | unit tests (`pytest`, interpreter on a tiny fake chip, oracle after **every** primitive, affine loops also run in reverse) | pass | pass |
 | `nki.simulate` vs numpy, incl. ×30 scores | 128×64, 64×128, 96×32, 128×128 | 128×64, 256×64, 384×128, 512×32 (and 256×128) |
-| `neuronx-cc` compile only (`kernel_check.py --mode compile`, no core needed) | same shapes: compiles | same shapes: compiles |
+| `neuronx-cc` compile only (`kernel_check.py --mode compile`, no core needed; requires a non-empty NEFF, observed 26-32 KiB in 1.5-2.4 s) | same shapes: compiles | same shapes: compiles |
 | NeuronCore (`--mode hw`) | **not run for this change**: the node's cores were held by another job | not run, same reason |
 
 The hand-written reference kernel (`tests/test_emit.py::GOLDEN_ATTENTION_SOURCE`, the exact source emitted from a
