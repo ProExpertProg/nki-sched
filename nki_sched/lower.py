@@ -53,6 +53,10 @@ def check_hw(proc: ir.Proc, hw: HardwareConfig):
             dst = bufs[s.arg("dst").buf]
             if dst.dtype != "f32":
                 raise HardwareError(f"ns.tensor.matmul: dst ({dst.name}) must be f32 (PSUM accumulators), got {dst.dtype}")
+        if s.instr == "ns.tensor.transpose":
+            src, dst = bufs[s.arg("src").buf], bufs[s.arg("dst").buf]
+            if dst.dtype != src.dtype:
+                raise HardwareError(f"ns.tensor.transpose: dst ({dst.name}: {dst.dtype}) must have the dtype of src ({src.name}: {src.dtype})")
         if ins.check is not None:
             ins.check(s, hw, ub)
 

@@ -10,12 +10,13 @@ from dataclasses import replace
 from typing import Callable, Optional
 
 from . import ir
-from .analysis import AnalysisError, const_int, injective, loop_ranges, region
+from .analysis import AnalysisError, injective, loop_ranges, region
 from .emit import emit_nki
 from .expr import Aff, Var, var
 from .hw import NC_DEFAULT, HardwareConfig, HardwareError
 from .instrs import INSTRS
 from .lower import check_hw, copy_nest_to_call, infer_kinds, nest_window
+from . import transforms
 from .match import MatchError, match_instr
 
 
@@ -75,13 +76,6 @@ class Sched:
         if b is None:
             raise ScheduleError(f"no buffer named '{name}'. Buffers: {list(ir.buffers_of(self.proc))}")
         return b
-
-    @staticmethod
-    def _const(e: Aff, what: str) -> int:
-        try:
-            return const_int(e, what)
-        except AnalysisError as err:
-            raise ScheduleError(f"{err}. Tile the loops so the window has a fixed size (e.g. split a symbolic loop).") from None
 
     def _fresh(self, name: str):
         if name in ir.buffers_of(self.proc) or name in ir.loop_vars(self.proc.body):
@@ -250,8 +244,6 @@ class Sched:
             lo, size = region(reads, loop_ranges(at_loop.body))
         except AnalysisError as e:
             raise ScheduleError(f"compute_at({stage}, at={at}): {e}") from None
-        for z in size:
-            self._const(z, f"compute_at({stage}, at={at}): the region of '{stage}' read inside '{at}'")
 
         new_prods = []
         for nest in prods:
@@ -309,59 +301,93 @@ class Sched:
         p = self.proc.with_(body=tuple(ir.map_stmts(self.proc.body, f)))
         self._commit(f"set_memory({buf}, {mem})", p)
 
-    def _staging(self, tensor, at, mem, name, direction):
-        at_loop = self._find(at)
+    def _container(self, at):
+        """(statements, rebuild) for the scope a staging buffer lives in: loop `at`'s body, or the whole
+        kernel when at is None. rebuild(new statements) -> the new Proc."""
+        if at is None:
+            return self.proc.body, lambda new: self.proc.with_(body=tuple(new))
+        loop = self._find(at)
+        return loop.body, lambda new: self._rewrite_loop(at, lambda f: (replace(f, body=tuple(new)),))
+
+    def _staging(self, tensor, at, mem, name, direction, perm=None):
+        stmts, rebuild = self._container(at)
+        where = f"at={at}" if at is not None else "at the kernel root"
         self._fresh(name)
         tb = self._buf(tensor)
+        reads = lambda st: any(r.buf == tensor for x in ir.walk((st,)) if isinstance(x, (ir.Assign, ir.Reduce)) for r in ir.expr_reads(x.rhs))  # noqa: E731
+        writes = lambda st: any(b == tensor and "w" in m for x in ir.walk((st,)) if not isinstance(x, ir.For) for m, b, _ in ir.accesses(x))  # noqa: E731
+        first_read = next((i for i, st in enumerate(stmts) if reads(st)), None)
         if direction == "in":
-            idxs = [r.idx for s in ir.walk(at_loop.body) if isinstance(s, (ir.Assign, ir.Reduce)) for r in ir.expr_reads(s.rhs) if r.buf == tensor]
-            if any(m != "r" for s in ir.walk(at_loop.body) for m, b, _ in ir.accesses(s) if b == tensor):
-                raise ScheduleError(f"stage_in({tensor}): '{tensor}' is also written inside '{at}'; use stage_out or restructure")
+            idxs = [r.idx for st in ir.walk(stmts) if isinstance(st, (ir.Assign, ir.Reduce)) for r in ir.expr_reads(st.rhs) if r.buf == tensor]
+            late = [i for i, st in enumerate(stmts) if writes(st) and (first_read is None or i >= first_read)]
+            if late:
+                raise ScheduleError(f"stage_in({tensor}): '{tensor}' is written inside the scope ({where}) at or after its first read; "
+                                    f"stage it where it is only read, or use stage_out")
         else:
-            acc = [(m, loc) for s in ir.walk(at_loop.body) for m, b, loc in ir.accesses(s) if b == tensor]
+            acc = [(m, loc) for st in ir.walk(stmts) for m, b, loc in ir.accesses(st) if b == tensor]
             if any(m != "w" for m, _ in acc):
                 raise ScheduleError(f"stage_out({tensor}): '{tensor}' is also read inside '{at}' (needs a load as well; not supported yet)")
             idxs = [tuple(loc) for _, loc in acc]
         if not idxs:
-            raise ScheduleError(f"stage_{direction}({tensor}, at={at}): no accesses to '{tensor}' inside '{at}'")
+            raise ScheduleError(f"stage_{direction}({tensor}, {where}): no accesses to '{tensor}' inside the scope")
         try:
-            lo, size = region(idxs, loop_ranges(at_loop.body))
+            lo, size = region(idxs, loop_ranges(stmts))
         except AnalysisError as e:
             raise ScheduleError(f"stage_{direction}({tensor}): {e}") from None
-        for z in size:
-            self._const(z, f"stage_{direction}({tensor}, at={at}): the window of '{tensor}' accessed inside '{at}'")
-        nb = ir.Buffer(name, tuple(size), tb.dtype, mem, "temp")
-        full = ir.Window(name, tuple(Aff(0) for _ in size), tuple(size))
+        perm = tuple(perm) if perm is not None else tuple(range(len(size)))
+        if sorted(perm) != list(range(len(size))):
+            raise ScheduleError(f"perm {perm} is not a permutation of the {len(size)} dims of '{tensor}'")
+        shape = tuple(size[i] for i in perm)
+        nb = ir.Buffer(name, shape, tb.dtype, mem, "temp")
+        full = ir.Window(name, tuple(Aff(0) for _ in shape), shape)
         win = ir.Window(tensor, tuple(lo), tuple(size))
-        rebase = lambda idx: tuple(i - l for i, l in zip(idx, lo))
-        body = tuple(ir.remap_buf(b, tensor, name, rebase) for b in at_loop.body)
+        rebase = lambda idx: tuple(idx[i] - lo[i] for i in perm)  # noqa: E731
+        # reads are redirected from the first reader on; whatever produced the tensor earlier is left alone
+        start = first_read if direction == "in" else 0
+        body = list(stmts[:start]) + [ir.remap_buf(st, tensor, name, rebase) for st in stmts[start:]]
+        if direction == "in" and perm != tuple(range(len(perm))) and any(
+                isinstance(x, ir.Call) and any(w.buf == tensor for _, w in x.args) for st in stmts[start:] for x in ir.walk((st,))):
+            raise ScheduleError(f"stage_in({tensor}, perm={perm}): an instruction after the first reader already uses '{tensor}' directly; "
+                                f"transposed staging can only redirect scalar loop nests")
         if direction == "in":
-            src_mem, dst_mem = tb.mem, mem
-            cp = self._copy_call(full, win, src_mem, dst_mem)
-            new_body = (ir.Alloc(nb), cp) + body
+            cp = self._copy_call(full, win, tb.mem, mem, perm)
+            body[first_read:first_read] = [ir.Alloc(nb), cp]
         else:
-            cp = self._copy_call(win, full, mem, tb.mem)
-            new_body = (ir.Alloc(nb),) + body + (cp,)
-        new_at = replace(at_loop, body=new_body)
-        p = self._rewrite_loop(at, lambda f: (new_at,))
-        self._commit(f"stage_{direction}({tensor}, at={at}, {mem}, {name})", p)
+            cp = self._copy_call(win, full, mem, tb.mem, perm)
+            body = [ir.Alloc(nb)] + body + [cp]
+        self._commit(f"stage_{direction}({tensor}, {where}, {mem}, {name})", rebuild(body))
 
     @staticmethod
-    def _copy_call(dst: ir.Window, src: ir.Window, src_mem: str, dst_mem: str):
+    def _copy_call(dst: ir.Window, src: ir.Window, src_mem: str, dst_mem: str, perm: tuple = ()):
+        if perm and tuple(perm) != tuple(range(len(perm))):
+            if tuple(perm) != (1, 0) or (src_mem, dst_mem) != (ir.SBUF, ir.PSUM):
+                raise ScheduleError(
+                    f"a transposed copy (perm={tuple(perm)}) is only available as a tensor-engine transpose of a 2-D tile from "
+                    f"SBUF into PSUM; this staging goes {src_mem} -> {dst_mem}. Stage the operand into SBUF first "
+                    f"(float32 cannot use the DMA transpose), then transpose it into PSUM -- or use stage_transposed")
+            return ir.Call("ns.tensor.transpose", (("dst", dst), ("src", src)))
         if ir.HBM in (src_mem, dst_mem):
             if src_mem == dst_mem:
                 raise ScheduleError("HBM -> HBM staging copies are not supported")
             return ir.Call("ns.sync.dma_copy", (("dst", dst), ("src", src)))
         return ir.Call("ns.vector.tensor_copy", (("dst", dst), ("src", src)))
 
-    def stage_in(self, tensor: str, at: str, mem: str, name: str):
-        """cache_read: copy the window of `tensor` read inside loop `at` into a new buffer in
-        `mem` at the start of `at`'s body; accesses are redirected. The copy is created directly as
-        the right ns instruction (HBM->SBUF: ns.sync.dma_copy)."""
-        self._staging(tensor, at, mem, name, "in")
+    def stage_in(self, tensor: str, at: Optional[str], mem: str, name: str, perm: Optional[tuple] = None):
+        """cache_read: copy the window of `tensor` read inside loop `at` (or anywhere, for at=None) into a
+        new buffer in `mem`, placed just before the first reader; reads are redirected to it. The copy is
+        created as the right ns instruction from the memory spaces (HBM->SBUF: ns.sync.dma_copy). With
+        perm=(1, 0) the buffer is the transpose of the window (SBUF -> PSUM, ns.tensor.transpose)."""
+        self._staging(tensor, at, mem, name, "in", perm)
         return name
 
-    def stage_out(self, tensor: str, at: str, mem: str, name: str):
+    def stage_transposed(self, tensor: str, name: str, at: Optional[str] = None) -> str:
+        """The operand layout a matmul needs ([k, m] with the contraction on the partition axis) from a
+        [m, k] tile: transpose it on the tensor engine into PSUM (`<name>_ps`), then copy to SBUF `name`.
+        `tensor` must already be in SBUF."""
+        ps = self.stage_in(tensor, at=at, mem=ir.PSUM, name=f"{name}_ps", perm=(1, 0))
+        return self.stage_in(ps, at=at, mem=ir.SBUF, name=name)
+
+    def stage_out(self, tensor: str, at: Optional[str], mem: str, name: str):
         """cache_write: writes to `tensor` inside `at` go to a new buffer in `mem`; the window is
         copied out after `at`'s body."""
         self._staging(tensor, at, mem, name, "out")
@@ -422,6 +448,17 @@ class Sched:
             return False
         w, _ = nest_window(window.buf, inner[0].idx, {c.var: c.extent for c in ch})
         return w is not None and w.lo == window.lo and w.size == window.size
+
+    def recip_divisor(self, stage: str):
+        """Rewrite `a / b` in `stage` as `a * (1/b)` with the reciprocal computed once (the hardware
+        multiplies by a per-row vector or scalar but cannot divide by one). Not bit-exact; recorded in
+        `notes`."""
+        try:
+            p = transforms.recip_divisor(self.proc, stage)
+        except transforms.TransformError as e:
+            raise ScheduleError(f"recip_divisor({stage}): {e}") from None
+        self.notes.append(f"recip_divisor({stage}) rewrites a / b as a * (1 / b): equal up to rounding, not bit-exact")
+        self._commit(f"recip_divisor({stage})", p)
 
     def bound(self, size: str, max: int):
         """Assume the size symbol `size` is at most `max`; the emitted kernel asserts it. This is what

@@ -84,7 +84,7 @@ def test_stage_in_redirects_every_read_to_the_tile_relative_buffer(tiled):
 
 @pytest.mark.parametrize("tensor, at, name, message", [
     ("nope", "ko", "x", "no buffer named"),
-    ("rhs", "mo", "x", "not a compile-time constant"),   # the k sweep inside `mo` has symbolic extent K
+    ("rhs", "mo", "x", "not bounded"),   # the k sweep inside `mo` has symbolic extent K: an unbounded partition dim
     ("lhsT", "ko", "C", "already in use"),
     ("C", "ko", "x", "also written inside|no accesses"),
 ])

@@ -13,12 +13,15 @@ class Mismatch(Exception):
     pass
 
 
-def hostile_inputs(shapes_by_arg: dict, seed=0, dtype="f32"):
-    """Random inputs plus the usual hostile cases (a large-magnitude element)."""
+MATMUL_ARGS = {"lhsT": ("K", "M"), "rhs": ("K", "N")}
+
+
+def hostile_inputs(shapes_by_arg: dict, seed=0, dtype="f32", scale=1.0):
+    """Random inputs (times `scale`) plus the usual hostile case: one large-magnitude element."""
     r = np.random.default_rng(seed)
     out = {}
     for name, shp in shapes_by_arg.items():
-        x = r.standard_normal(shp).astype(np.float32)
+        x = (r.standard_normal(shp) * scale).astype(np.float32)
         if x.size > 1:
             x.flat[0] = 1e3  # large-magnitude element
         out[name] = interp.quantize(dtype, x)
@@ -54,21 +57,29 @@ def _compare(got, want, rtol, atol, shp, reverse):
                        f"got {got[where] if where else got.shape}, want {want[where] if where else want.shape}")
 
 
-def make_checker(oracle, shapes, out="C", rtol=1e-4, atol=1e-4, dtype="f32", seeds=(0, 1), reverse_affine=True):
-    """shapes: list of dicts {"K":..,"M":..,"N":..}. Raises Mismatch with a locating message.
+def make_checker(oracle, shapes, args=None, out="C", rtol=1e-4, atol=1e-4, dtype="f32", seeds=(0, 1),
+                 scales=(1.0,), reverse_affine=True):
+    """Differential test of an intermediate program against `oracle`.
+
+    shapes: list of {size symbol: value}; args: {arg name: tuple of size symbols} (default: the matmul's
+    lhsT[K,M], rhs[K,N]); scales: input magnitudes to try (attention uses a large one, to overflow a naive
+    exp). Raises Mismatch with a locating message.
 
     With reverse_affine the program is run a second time with every (inferred or marked) affine loop
     iterated in reverse order: an affine annotation on a loop that actually carries a dependence then
     fails the oracle, so the loop-kind analysis is itself tested, not trusted."""
+    args = args or MATMUL_ARGS
 
     def check(proc: ir.Proc):
         for shp in shapes:
             for seed in seeds:
-                inputs = hostile_inputs({"lhsT": (shp["K"], shp["M"]), "rhs": (shp["K"], shp["N"])}, seed, dtype)
-                want = oracle(inputs)
-                runs = [(proc, False)] + ([(infer_kinds(proc), True)] if reverse_affine else [])
-                for prog, rev in runs:
-                    got = interp.run(prog, inputs, reverse_affine=rev)[out]
-                    _compare(got, want, rtol, atol, shp, rev)
+                for sc in scales:
+                    arg_shapes = {n: tuple(shp[d] for d in dims) for n, dims in args.items()}
+                    inputs = hostile_inputs(arg_shapes, seed, dtype, sc)
+                    want = oracle(inputs)
+                    runs = [(proc, False)] + ([(infer_kinds(proc), True)] if reverse_affine else [])
+                    for prog, rev in runs:
+                        got = interp.run(prog, inputs, reverse_affine=rev)[out]
+                        _compare(got, want, rtol, atol, shp, rev)
 
     return check
