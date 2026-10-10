@@ -155,6 +155,7 @@ def trace(fn, args: dict, name: str = "kernel", output: str = "C") -> ir.Proc:
     args: ordered {argument name: ArgSpec}, in the order of fn's parameters.
     name: entry-point name of the kernel; output: name of the output buffer."""
     import torch
+    from torch.export import Dim
 
     examples = []
     for spec in args.values():
@@ -166,7 +167,22 @@ def trace(fn, args: dict, name: str = "kernel", output: str = "C") -> ir.Proc:
         def forward(self, *a):
             return fn(*a)
 
-    graph = torch.export.export(_Spec(), tuple(examples)).graph_module.graph
+    # Every symbolic dim name becomes one torch.export Dim (equal names are one Dim), so the exported
+    # graph keeps shapes symbolic: shape-dependent scalars such as `q.shape[1] ** 0.5` stay expressions
+    # over the dims instead of being baked in as the example's number.
+    dims = {}
+    shapes = []
+    for spec in args.values():
+        shapes.append({i: dims.setdefault(d, Dim(d, min=2)) for i, d in enumerate(spec.dims) if isinstance(d, str)})
+    try:
+        graph = torch.export.export(_Spec(), tuple(examples), dynamic_shapes=(tuple(shapes),)).graph_module.graph
+    except Exception as e:  # noqa: BLE001  torch reports constraint violations, shape errors, ... as many types
+        lines = [l.strip(" -") for l in str(e).strip().splitlines()]
+        detail = [l for l in lines if "must always be equal" in l or "specialized" in l]
+        if detail:
+            raise TraceError("the spec forces some dims to be equal or constant; give dims that must be equal the "
+                             "same name in arg(...). torch says: " + " ".join(detail)[:400]) from None
+        raise TraceError(f"torch.export could not trace the spec: {lines[0][:300]}") from None
     b = _Builder(args, output)
     env = {}
     placeholders = iter(args.items())

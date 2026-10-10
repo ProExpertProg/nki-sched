@@ -112,8 +112,9 @@ def test_bf16_trace_matches_torch_bf16_after_rounding():
 @pytest.mark.parametrize("fn, dims, shapes, message", [
     (lambda lhsT, rhs: torch.relu(lhsT.T @ rhs), (("K", "M"), ("K", "N")), ((8, 4), (8, 8)), "unsupported torch op in spec: aten.relu"),
     (lambda lhsT, rhs: lhsT + rhs, (("A", "B"), ("A", "B")), ((4, 4), (4, 4)), "unsupported torch op in spec: aten.add"),
-    # numerically consistent example shapes, but the contraction dims are different symbols
-    (lambda lhsT, rhs: lhsT.T @ rhs, (("K", "M"), ("J", "N")), ((8, 4), (8, 8)), "contraction dims differ"),
+    # numerically consistent example shapes, but the contraction dims are different symbols: torch itself
+    # refuses (they would have to be equal), and the error tells the user to name them the same
+    (lambda lhsT, rhs: lhsT.T @ rhs, (("K", "M"), ("J", "N")), ((8, 4), (8, 8)), "must always be equal"),
 ])
 def test_trace_errors_name_the_problem(fn, dims, shapes, message):
     with pytest.raises(TraceError, match=message):
