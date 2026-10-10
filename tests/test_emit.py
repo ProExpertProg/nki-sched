@@ -146,3 +146,72 @@ def test_hardware_legality_is_checked_at_emission():
 def test_hbm_temporaries_are_allocated_in_hbm():
     src = emit_nki(tiny_proc(ir.Alloc(ir.Buffer("tmp", (sym("N"),), "f32", ir.HBM))))
     assert "tmp = nl.ndarray((N,), dtype=nl.float32, buffer=nl.hbm)" in src
+
+
+GOLDEN_ATTENTION_SOURCE = """\
+import nki
+import nki.isa as nisa
+import nki.language as nl
+
+
+@nki.jit
+def nki_attention_(q, k, v):
+  S, D = q.shape
+  assert S <= 128, "expected S to be at most 128"
+  assert D <= 128, "expected D to be at most 128"
+  scale = (1.0 / (D ** 0.5))
+  assert 16 * D + 24 * S + 16 <= 196608, "SBUF footprint (bytes/partition, f32 worst case) exceeds the budget; block the loops"
+  O = nl.ndarray((S, D), dtype=q.dtype, buffer=nl.shared_hbm)
+
+  q_sb = nl.ndarray((S, D), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.dma_copy(dst=q_sb, src=q)
+  k_sb = nl.ndarray((S, D), dtype=k.dtype, buffer=nl.sbuf)
+  nisa.dma_copy(dst=k_sb, src=k)
+  v_sb = nl.ndarray((S, D), dtype=v.dtype, buffer=nl.sbuf)
+  nisa.dma_copy(dst=v_sb, src=v)
+  qT_ps = nl.ndarray((D, S), dtype=q.dtype, buffer=nl.psum)
+  nisa.nc_transpose(dst=qT_ps, data=q_sb)
+  qT = nl.ndarray((D, S), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.tensor_copy(dst=qT, src=qT_ps)
+  kT_ps = nl.ndarray((D, S), dtype=k.dtype, buffer=nl.psum)
+  nisa.nc_transpose(dst=kT_ps, data=k_sb)
+  kT = nl.ndarray((D, S), dtype=k.dtype, buffer=nl.sbuf)
+  nisa.tensor_copy(dst=kT, src=kT_ps)
+  s_ps = nl.ndarray((S, S), dtype=nl.float32, buffer=nl.psum)
+  nisa.nc_matmul(dst=s_ps, stationary=qT, moving=kT)
+  s_sb = nl.ndarray((S, S), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.tensor_scalar(dst=s_sb, data=s_ps, op0=nl.multiply, operand0=scale)
+  m = nl.ndarray((S, 1), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.tensor_reduce(dst=m, data=s_sb, op=nl.maximum, axis=1)
+  nm = nl.ndarray((S, 1), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.tensor_scalar(dst=nm, data=m, op0=nl.multiply, operand0=-1.0)
+  e = nl.ndarray((S, S), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.activation(dst=e, data=s_sb, bias=nm, op=nl.exp)
+  ssum = nl.ndarray((S, 1), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.tensor_reduce(dst=ssum, data=e, op=nl.add, axis=1)
+  rsum = nl.ndarray((S, 1), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.reciprocal(dst=rsum, data=ssum)
+  p = nl.ndarray((S, S), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.tensor_scalar(dst=p, data=e, op0=nl.multiply, operand0=rsum)
+  pT_ps = nl.ndarray((S, S), dtype=q.dtype, buffer=nl.psum)
+  nisa.nc_transpose(dst=pT_ps, data=p)
+  pT = nl.ndarray((S, S), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.tensor_copy(dst=pT, src=pT_ps)
+  o_ps = nl.ndarray((S, D), dtype=nl.float32, buffer=nl.psum)
+  nisa.nc_matmul(dst=o_ps, stationary=pT, moving=v_sb)
+  o_sb = nl.ndarray((S, D), dtype=q.dtype, buffer=nl.sbuf)
+  nisa.tensor_copy(dst=o_sb, src=o_ps)
+  nisa.dma_copy(dst=O, src=o_sb)
+
+  return O
+"""
+
+
+def test_golden_attention_emits_exactly_this_source(build_golden_attention):
+    """Verified on a Trainium node: simulator (seq/dim 128x64, 64x128, 96x32, 128x128, incl. x30 scores that
+    overflow a naive exp) and a neuronx-cc compile. Emission is shape-generic: S, D <= 128 are asserted."""
+    assert emit_nki(build_golden_attention(), NC_DEFAULT) == GOLDEN_ATTENTION_SOURCE
+
+
+def test_golden_attention_is_valid_python(build_golden_attention):
+    compile(emit_nki(build_golden_attention(), NC_DEFAULT), "<emitted>", "exec")

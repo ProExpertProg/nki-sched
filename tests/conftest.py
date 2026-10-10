@@ -127,3 +127,62 @@ def build_golden_l4():
         )
 
     return build
+
+
+@pytest.fixture
+def build_golden_attention():
+    """factory: single-tile attention (S, D <= 128) written out by hand at the ns level -- the program the
+    attention schedule must produce. Mirrors the NKI idiom: q^T/k^T/p^T by tensor-engine transposes, the
+    row max as a [S,1] tile, exp with a per-row bias, reciprocal + per-row scale for the normalisation."""
+    from nki_sched import scalar as sc
+    from nki_sched.expr import Aff as A
+
+    def build(name="nki_attention_"):
+        S, D = sym("S"), sym("D")
+        I = ir.Alloc
+
+        def B(nm, *shape, mem=ir.SBUF, dtype="like:q"):
+            return ir.Buffer(nm, tuple(shape), dtype, mem)
+
+        def W(b):
+            return ir.Window(b.name, (A(0),) * len(b.shape), b.shape)
+
+        def call(instr, **roles):
+            return ir.Call(instr, tuple((r, W(b)) for r, b in roles.items()), ())
+
+        q = ir.Buffer("q", (S, D), "like:q", ir.HBM, "arg")
+        k = ir.Buffer("k", (S, D), "like:k", ir.HBM, "arg")
+        v = ir.Buffer("v", (S, D), "like:v", ir.HBM, "arg")
+        out = ir.Buffer("O", (S, D), "like:q", ir.HBM, "out")
+        q_sb, k_sb, v_sb = B("q_sb", S, D), B("k_sb", S, D, dtype="like:k"), B("v_sb", S, D, dtype="like:v")
+        qT_ps, qT = B("qT_ps", D, S, mem=ir.PSUM), B("qT", D, S)
+        kT_ps, kT = B("kT_ps", D, S, mem=ir.PSUM, dtype="like:k"), B("kT", D, S, dtype="like:k")
+        s_ps, s_sb = B("s_ps", S, S, mem=ir.PSUM, dtype="f32"), B("s_sb", S, S)
+        m, nm, e = B("m", S, A(1)), B("nm", S, A(1)), B("e", S, S)
+        ssum, rsum, p = B("ssum", S, A(1)), B("rsum", S, A(1)), B("p", S, S)
+        pT_ps, pT = B("pT_ps", S, S, mem=ir.PSUM), B("pT", S, S)
+        o_ps, o_sb = B("o_ps", S, D, mem=ir.PSUM, dtype="f32"), B("o_sb", S, D)
+        mm = lambda dst, st, mv: ir.Call("ns.tensor.matmul", (("dst", W(dst)), ("stationary", W(st)), ("moving", W(mv))), (("accumulate", None),))  # noqa: E731
+        scale_call = ir.Call("ns.vector.scale", (("dst", W(s_sb)), ("src", W(s_ps))), (("c", ir.Param("scale")),))
+        body = (
+            I(q_sb), call("ns.sync.dma_copy", dst=q_sb, src=q), I(k_sb), call("ns.sync.dma_copy", dst=k_sb, src=k),
+            I(v_sb), call("ns.sync.dma_copy", dst=v_sb, src=v),
+            I(qT_ps), call("ns.tensor.transpose", dst=qT_ps, src=q_sb), I(qT), call("ns.vector.tensor_copy", dst=qT, src=qT_ps),
+            I(kT_ps), call("ns.tensor.transpose", dst=kT_ps, src=k_sb), I(kT), call("ns.vector.tensor_copy", dst=kT, src=kT_ps),
+            I(s_ps), mm(s_ps, qT, kT), I(s_sb), scale_call,
+            I(m), call("ns.vector.reduce_max", dst=m, src=s_sb), I(nm), call("ns.vector.negate", dst=nm, src=m),
+            I(e), call("ns.scalar.exp_bias", dst=e, src=s_sb, bias=nm),
+            I(ssum), call("ns.vector.reduce_sum", dst=ssum, src=e), I(rsum), call("ns.vector.reciprocal", dst=rsum, src=ssum),
+            I(p), call("ns.vector.scale_rows", dst=p, src=e, vec=rsum),
+            I(pT_ps), call("ns.tensor.transpose", dst=pT_ps, src=p), I(pT), call("ns.vector.tensor_copy", dst=pT, src=pT_ps),
+            I(o_ps), mm(o_ps, pT, v_sb), I(o_sb), call("ns.vector.tensor_copy", dst=o_sb, src=o_ps),
+            call("ns.sync.dma_copy", dst=out, src=o_sb),
+        )
+        return ir.Proc(
+            name=name, args=(q, k, v, out),
+            sizes=(("S", "q", 0), ("D", "q", 1)), body=body,
+            assumptions=(ir.Bound(S, 128), ir.Bound(D, 128)),
+            fparams=(("scale", sc.SBin("div", sc.SConst(1.0), sc.SBin("pow", sc.SSize(D), sc.SConst(0.5)))),),
+        )
+
+    return build
