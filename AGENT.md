@@ -13,6 +13,18 @@ def schedule(s, hw):
 Always take tile sizes from `hw`: the schedule is first replayed on a tiny fake chip (pmax=4,
 fmax=4/8) and checked numerically after every call; a hardcoded 128 fails there.
 
+`hw` is a frozen `HardwareConfig` of plain ints and nothing else (real chip values in brackets):
+
+| field | meaning |
+|---|---|
+| `hw.pmax` [128] | max rows (partition axis, axis 0) of an SBUF/PSUM tile; max contraction `k` per matmul |
+| `hw.stationary_fmax` [128] | max `m` (free size of the stationary operand) per matmul |
+| `hw.moving_fmax` [512] | max `n` (free size of the moving operand) per matmul; also one f32 PSUM bank |
+| `hw.psum_banks` [8], `hw.psum_bank_bytes` [2048/partition], `hw.sbuf_bytes_per_partition` [196608] | capacities |
+
+It has no problem sizes: K, M, N are symbolic (`M // hw.stationary_fmax` stays symbolic), so `hw.K`
+does not exist and you never compute a loop count yourself.
+
 ## The program you start from (matmul `C[m,n] = cast(sum_k lhsT[k,m] * rhs[k,n])`)
 
 Sizes K, M, N are symbolic. `lhsT` is `[K,M]` (contraction on axis 0), `rhs` is `[K,N]`, `C` is `[M,N]`.

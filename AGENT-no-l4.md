@@ -1,0 +1,81 @@
+# nki-sched: write a schedule, not a kernel
+
+You do not write NKI. You write a **schedule**: a short Python function that rewrites a naive loop
+program step by step. Each call is checked; the final program is emitted as a verified NKI kernel.
+A failed call raises an error that says what rule you broke; fix that call (and what depends on it).
+
+```python
+def schedule(s, hw):
+    ...   # calls on s; use hw.pmax / hw.stationary_fmax / hw.moving_fmax, never the literals 128 / 512
+```
+
+`PSUM`, `SBUF` and `hw` are already in scope. No imports. Reply with one python block holding `schedule`.
+Always take tile sizes from `hw`: the schedule is first replayed on a tiny fake chip (pmax=4,
+fmax=4/8) and checked numerically after every call; a hardcoded 128 fails there.
+
+`hw` is a frozen `HardwareConfig` of plain ints and nothing else (real chip values in brackets):
+
+| field | meaning |
+|---|---|
+| `hw.pmax` [128] | max rows (partition axis, axis 0) of an SBUF/PSUM tile; max contraction `k` per matmul |
+| `hw.stationary_fmax` [128] | max `m` (free size of the stationary operand) per matmul |
+| `hw.moving_fmax` [512] | max `n` (free size of the moving operand) per matmul; also one f32 PSUM bank |
+| `hw.psum_banks` [8], `hw.psum_bank_bytes` [2048/partition], `hw.sbuf_bytes_per_partition` [196608] | capacities |
+
+It has no problem sizes: K, M, N are symbolic (`M // hw.stationary_fmax` stays symbolic), so `hw.K`
+does not exist and you never compute a loop count yourself.
+
+## The program you start from (matmul `C[m,n] = cast(sum_k lhsT[k,m] * rhs[k,n])`)
+
+Sizes K, M, N are symbolic. `lhsT` is `[K,M]` (contraction on axis 0), `rhs` is `[K,N]`, `C` is `[M,N]`.
+Loop names are `stage.var`, and every handle is just such a name (a string):
+
+```
+alloc matmul : f32[M,N] @ HBM                    # accumulator stage
+for matmul.init.m, matmul.init.n: matmul[m,n] = 0      # init nest
+for matmul.m: for matmul.n: for matmul.k: matmul[m,n] += lhsT[k,m] * rhs[k,n]    # update nest
+for C.m: for C.n: C[m,n] = cast(matmul[m,n])     # output nest
+```
+
+## Primitives (all take loop/buffer names as strings)
+
+| call | effect |
+|---|---|
+| `o, i = s.split(loop, factor, names=("o","i"), perfect=True)` | `loop -> o*factor + i`; `perfect=True` asserts extent % factor == 0 (needed for symbolic M,N,K). Returns the new names; the old name stops existing |
+| `s.reorder(a, b, c, ...)` | permute a perfectly nested chain of loops, outermost first. Legal for reductions (`matmul.k` may move freely); refused if it reverses a dependence |
+| `s.compute_at(stage, at=loop)` | move stage `matmul` (alloc + init + update nests) inside loop `at`, shrunk to the region consumed there |
+| `s.set_memory(buf, PSUM or SBUF)` | PSUM: f32, axis 0 <= `hw.pmax`, free size <= one bank (`hw.moving_fmax` f32). SBUF: axis 0 <= `hw.pmax` |
+| `s.stage_in(tensor, at=loop, mem=SBUF, name="x_sb")` | copy the window of `tensor` read inside `at` into a new buffer at the top of `at` (HBM->SBUF DMA); reads are redirected |
+| `s.stage_out(tensor, at=loop, mem=SBUF, name="c_sb")` | writes to `tensor` inside `at` go to a new buffer, DMA'd out after `at` |
+| `s.replace(loop, "ns.tensor.matmul")` | tensorize: the perfect 3-loop nest rooted at `loop` (k, m, n in any order) around one `+=` becomes one hardware matmul. Needs: dst in PSUM, both operands in SBUF laid out `[k,m]` and `[k,n]`, k <= `hw.pmax`, m <= `hw.stationary_fmax`, n <= `hw.moving_fmax` |
+| `s.fold_init(buf)` | drop the zero-init nest of a PSUM accumulator; the first matmul overwrites |
+| `s.hoist(buf, to=loop_or_None)` | move the fill of a `stage_in` buffer out to loop `to` (`None` = top of kernel). If loops between grow the window the buffer grows to hold it all (K tiles fold into axis 1); loops that do not index the source just reuse the data. Fewer HBM reloads |
+| `s.mark(loop, "affine"/"sequential"/"static")` | optional assertion about loop kind |
+| `s.loops(stage)` -> names, `s.show()` -> current program text | inspection only |
+
+The cast-out nest `C_sb[m,n] = cast(matmul[m,n])` between PSUM and SBUF is turned into a vector copy
+automatically; you do not tensorize it.
+
+## Optimising
+
+The checker also counts HBM bytes against the floor (each input and the output moved once).
+Work out how many times each operand is loaded: a load inside a loop that does not index it is
+repeated on every iteration of that loop, and the cost grows with the operand's size. Loop order
+decides which loads get repeated, and `hoist` moves a load out past loops (`to=None` = out of all of
+them, SBUF capacity permitting). Use `s.show()` to see where each `dma_copy` ends up. After a failure,
+the `s.show()` output in the report is the program as of the last successful call: read the loop and
+buffer names from it.
+
+## Errors
+
+A `ScheduleError` names the primitive and the violated rule; the report also gives the program state
+before the failing call and the calls that succeeded. Names that were split no longer exist: use
+the returned `o, i` names.
+
+## When nothing fails but the checker is not satisfied
+
+A schedule can apply cleanly and still miss the HBM-traffic ceiling. Then there is no error to fix:
+the schedule itself needs to change. Keep what is correct (tiling, staging, tensorize), take the
+reported traffic ratio and the emitted program, find which loads are repeated most, and restructure
+loop order and hoisting to cut them. Re-applying the same hoists in a different place is not a new
+idea; if a change leaves the ratio unchanged, the loads you moved were not the expensive ones.
