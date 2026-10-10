@@ -326,7 +326,7 @@ class Sched:
         first_read = next((i for i, st in enumerate(stmts) if reads(st)), None)
         if direction == "in":
             idxs = [r.idx for st in ir.walk(stmts) if isinstance(st, (ir.Assign, ir.Reduce)) for r in ir.expr_reads(st.rhs) if r.buf == tensor]
-            late = [i for i, st in enumerate(stmts) if writes(st) and (first_read is None or i >= first_read)]
+            late = [i for i, st in enumerate(stmts) if writes(st) and first_read is not None and i >= first_read]
             if late:
                 raise ScheduleError(f"stage_in({tensor}): '{tensor}' is written inside the scope ({where}) at or after its first read; "
                                     f"stage it where it is only read, or use stage_out")

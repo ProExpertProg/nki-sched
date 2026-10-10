@@ -186,3 +186,63 @@ def build_golden_attention():
         )
 
     return build
+
+
+# ---------------------------------------------------------------------------------------- attention
+ATTENTION_ARGS = {n: ("S", "D") for n in ("q", "k", "v")}
+
+
+@pytest.fixture
+def attention_fn():
+    """the attention spec as torch writes it: softmax(q k^T / sqrt(D)) v"""
+    import torch
+
+    def attention(q, k, v):
+        return torch.softmax((q @ k.T) / (q.shape[1] ** 0.5), dim=-1) @ v
+
+    return attention
+
+
+@pytest.fixture
+def make_attention_proc(attention_fn):
+    """factory: traced attention (symbolic S, D)"""
+
+    def make(dtype="f32", name="attn"):
+        specs = {n: arg(("S", "D"), dtype, example=(8, 4)) for n in ("q", "k", "v")}
+        return trace(attention_fn, specs, name=name, output="O")
+
+    return make
+
+
+@pytest.fixture
+def naive_attention(make_attention_proc):
+    return make_attention_proc()
+
+
+@pytest.fixture
+def attention_inputs():
+    """factory: random q, k, v of shape [S, D], optionally scaled up (large scores overflow a naive exp)"""
+
+    def make(S, D, seed=0, scale=1.0):
+        r = np.random.default_rng(seed)
+        return {n: (r.standard_normal((S, D)) * scale).astype(np.float32) for n in ("q", "k", "v")}
+
+    return make
+
+
+@pytest.fixture
+def attention_oracle(attention_fn):
+    return verify.torch_oracle(attention_fn, ("q", "k", "v"))
+
+
+@pytest.fixture
+def new_attention_sched(make_attention_proc, tiny_hw, attention_oracle):
+    """factory: a Sched on the traced attention with tiny tiles; check=True runs the oracle (incl. x6 inputs and
+    reverse-affine) after every primitive. Shapes keep S a multiple of pmax=4 so the tiled schedule applies."""
+
+    def make(check=True, shapes=None, hw=None):
+        shapes = shapes or [dict(S=4, D=2), dict(S=8, D=4), dict(S=12, D=3)]
+        chk = verify.make_checker(attention_oracle, shapes, args=ATTENTION_ARGS, out="O", scales=(1.0, 6.0), seeds=(0,)) if check else None
+        return Sched(make_attention_proc(), hw or tiny_hw, check=chk)
+
+    return make
