@@ -461,13 +461,15 @@ class Sched:
         # every other access to buf must be a read after the matmuls (checked by the oracle step too)
         self._commit(f"fold_init({buf})", self.proc.with_(body=body))
 
-    def hoist(self, buf: str, to: str):
+    def hoist(self, buf: str, to: Optional[str]):
         """Re-stage `buf` (created by stage_in) at the outer loop `to`: its fill moves out of every
         loop between `to` and the original site. Loops whose variable strides the source window by
         exactly one tile (e.g. ko over K) *grow* the buffer: along the partition axis the tiles are
         folded into a new axis 1 ([128, T, n]); along a free axis the buffer is enlarged. Loops that
-        do not index the source (e.g. mo for an rhs tile) simply reuse the data."""
-        to_loop = self._find(to)
+        do not index the source (e.g. mo for an rhs tile) simply reuse the data. `to=None` hoists to
+        the top of the kernel."""
+        to_loop = self._find(to) if to is not None else None
+        container = to_loop.body if to_loop is not None else self.proc.body
 
         def search(stmts, path):
             for s in stmts:
@@ -479,7 +481,7 @@ class Sched:
                         return r
             return None
 
-        r = search(to_loop.body, [])
+        r = search(container, [])
         if r is None:
             raise ScheduleError(f"hoist({buf}, to={to}): '{buf}' is not allocated inside loop '{to}'")
         path, block = r
@@ -493,7 +495,7 @@ class Sched:
         if not fill.arg("dst").is_full(ir.buffers_of(self.proc)):
             raise ScheduleError(f"hoist({buf}): the fill must write the whole buffer")
         src = fill.arg("src")
-        for s in ir.walk(to_loop.body):
+        for s in ir.walk(container):
             if any(b == src.buf and "w" in m for m, b, _ in ir.accesses(s)):
                 raise ScheduleError(f"hoist({buf}): source '{src.buf}' is written inside '{to}'")
         hv = {l.var: l.extent for l in path}
@@ -556,7 +558,7 @@ class Sched:
             return s
 
         # the new fill: one copy per tile of every growing loop, executed once at `to`
-        new_vars = {v: f"{v}_ld" for v in growth}
+        new_vars = {v: f"{buf}_{v}_ld" for v in growth}
         for nv in new_vars.values():
             self._fresh(nv)
         subs = {v: var(nv) for v, nv in new_vars.items()}
@@ -568,9 +570,12 @@ class Sched:
         stmt = ir.Call(fill.instr, (("dst", dst), ("src", srcw)), fill.attrs)
         for v in reversed(list(growth)):
             stmt = ir.For(new_vars[v], hv[v], (stmt,), "", "auto")
-        new_body = (ir.Alloc(newbuf), stmt) + tuple(remap(x) for x in to_loop.body)
-        new_to = replace(to_loop, body=new_body)
-        p = self._rewrite_loop(to, lambda f: (new_to,))
+        new_body = (ir.Alloc(newbuf), stmt) + tuple(remap(x) for x in container)
+        if to_loop is None:
+            p = self.proc.with_(body=new_body)
+        else:
+            new_to = replace(to_loop, body=new_body)
+            p = self._rewrite_loop(to, lambda f: (new_to,))
         self._commit(f"hoist({buf}, to={to})", p)
 
     def mark(self, loop: str, kind: str):

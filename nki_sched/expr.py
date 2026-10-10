@@ -260,8 +260,11 @@ def sym(name: str) -> Aff:
 def to_py(e: Aff, rename=lambda n: n) -> str:
     """Python source for an index expression (for the NKI emitter)."""
     parts = []
+    combined = len(e.terms) > 1 or e.const != 0
     for a, c in e.terms:
         s = _atom_py(a, rename)
+        if isinstance(a, (FloorDiv, Mod, Prod)) and (c != 1 or combined):
+            s = f"({s})"
         if c == 1:
             parts.append(s)
         elif c == -1:
@@ -273,15 +276,19 @@ def to_py(e: Aff, rename=lambda n: n) -> str:
     return " + ".join(parts).replace("+ -", "- ")
 
 
+def _paren(src: str) -> str:
+    return f"({src})" if " " in src else src
+
+
 def _atom_py(a, rename):
     if isinstance(a, (Var, Sym)):
         return rename(a.name)
     if isinstance(a, FloorDiv):
-        return f"({to_py(a.num, rename)}) // {a.den}"
+        return f"{_paren(to_py(a.num, rename))} // {a.den}"
     if isinstance(a, Mod):
-        return f"({to_py(a.num, rename)}) % {a.den}"
+        return f"{_paren(to_py(a.num, rename))} % {a.den}"
     if isinstance(a, MinE):
         return f"min({to_py(a.a, rename)}, {to_py(a.b, rename)})"
     if isinstance(a, Prod):
-        return f"({to_py(a.a, rename)}) * ({to_py(a.b, rename)})"
+        return f"{_paren(to_py(a.a, rename))} * {_paren(to_py(a.b, rename))}"
     raise TypeError(a)

@@ -26,3 +26,15 @@ def l5(s, hw):
     l4(s, hw)
     s.reorder("no", "mo")
     s.hoist("rhs_sb", to="no")
+
+
+def l6(s, hw):
+    """Level 6/7 traffic target by *full residency*: on top of l5, hoist the whole lhsT to the top of
+    the kernel so each operand is loaded exactly once (byte floor). There are no block loops, so
+    the SBUF footprint grows with K*M; the emitted kernel asserts it fits. True symbolic blocking
+    (BM = min(4, M//128), K-blocking with several live PSUM tiles) is not implemented yet."""
+    l5(s, hw)
+    s.hoist("lhsT_sb", to=None)
+
+
+l7 = l6

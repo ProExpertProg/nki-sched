@@ -50,6 +50,19 @@ def window_src(w: ir.Window, bufs: dict) -> str:
     return f"{ident(w.buf)}[{', '.join(parts)}]"
 
 
+def sbuf_footprint(proc: ir.Proc) -> Aff:
+    """Upper bound on SBUF bytes per partition: every SBUF allocation counted once (no liveness
+    reuse), 4 bytes per element worst case since dtypes follow the inputs."""
+    total = Aff(0)
+    for s in ir.walk(proc.body):
+        if isinstance(s, ir.Alloc) and s.buf.mem == ir.SBUF:
+            el = Aff(1)
+            for d in s.buf.shape[1:]:
+                el = el * d
+            total = total + el * 4
+    return total
+
+
 def emit_nki(proc: ir.Proc, hw: HardwareConfig = NC_DEFAULT) -> str:
     """Finalize (copy selection, loop-kind inference, hardware legality) and print NKI source."""
     proc = select_copies(proc)
@@ -75,6 +88,12 @@ def emit_nki(proc: ir.Proc, hw: HardwareConfig = NC_DEFAULT) -> str:
         lines.append(f"{ind}{ident(name)} = {aff(e)}")
     for a in proc.assumptions:
         lines.append(f'{ind}assert {aff(a.expr)} % {a.mod} == 0, "expected {a.expr} to be a multiple of {a.mod}"')
+    foot = sbuf_footprint(proc)
+    if foot.is_const:
+        if foot.const > hw.sbuf_bytes_per_partition:
+            raise EmitError(f"SBUF footprint {foot.const} B/partition exceeds the {hw.sbuf_bytes_per_partition} B budget")
+    else:
+        lines.append(f'{ind}assert {aff(foot)} <= {hw.sbuf_bytes_per_partition}, "SBUF footprint (bytes/partition, f32 worst case) exceeds the budget; block the loops"')
     for o in outs:
         lines.append(f"{ind}{ident(o.name)} = nl.ndarray({shape_src(o.shape)}, dtype={dtype_src(o.dtype)}, buffer=nl.shared_hbm)")
     lines.append("")

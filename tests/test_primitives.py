@@ -139,3 +139,12 @@ def test_hoist_rejects_non_tile_stride():
     schedules.l4(s, TINY)
     with pytest.raises(ScheduleError, match="already allocated"):
         s.hoist("rhs_sb", to="ko")
+
+
+def test_l6_full_residency_checked_every_step():
+    s = mk()
+    schedules.l6(s, TINY)
+    lb = ir.buffers_of(s.proc)["lhsT_sb"]
+    assert len(lb.shape) == 3 and lb.shape[0].const == 4  # [128, K/128, M]
+    src = s.source()
+    assert "assert" in src and "SBUF footprint" in src
