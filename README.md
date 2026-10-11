@@ -1,4 +1,5 @@
 # nki-sched
+*This was an NYU-AWS hackaton project on 10/10/2026. Most of the code was written by Claude.*
 
 A scheduling language on top of NKI: write the algorithm in torch, transform it with a short schedule
 (tile, stage into SBUF/PSUM, tensorize, hoist, ...), emit a verified NKI kernel.
