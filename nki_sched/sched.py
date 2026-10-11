@@ -10,10 +10,10 @@ from dataclasses import replace
 from typing import Callable, Optional
 
 from . import ir
-from .analysis import AnalysisError, const_int, injective, loop_ranges, region
+from .analysis import AnalysisError, const_int, dim_interval, injective, loop_ranges, region
 from .emit import emit_nki
 from .expr import Aff, Var, var
-from .hw import INSTRS, NC_DEFAULT, HardwareConfig
+from .hw import DGE_MODES, INSTRS, NC_DEFAULT, HardwareConfig
 from .lower import HardwareError, check_hw, copy_nest_to_call, infer_kinds, nest_window
 
 
@@ -117,8 +117,10 @@ class Sched:
     def show(self):
         return str(self.proc)
 
-    def source(self) -> str:
-        return emit_nki(self.proc, self.hw)
+    def source(self, itemsize: int = 4) -> str:
+        """NKI source. `itemsize` is the element size of the (dtype-agnostic) kernel arguments, used
+        only for the SBUF footprint assertion; 4 assumes f32, pass 2 for a bf16 kernel."""
+        return emit_nki(self.proc, self.hw, itemsize)
 
     # ------------------------------------------------------------------ split
     def split(self, loop: str, factor: int, names=None, perfect: bool = False):
@@ -307,6 +309,65 @@ class Sched:
         p = self.proc.with_(body=tuple(ir.map_stmts(self.proc.body, f)))
         self._commit(f"set_memory({buf}, {mem})", p)
 
+    def fold(self, buf: str, tile: Optional[int] = None):
+        self._commit(f"fold({buf}, {self.hw.pmax if tile is None else tile})", self._fold_proc(self.proc, buf, tile))
+
+    def _fold_proc(self, proc: ir.Proc, buf: str, tile: Optional[int] = None) -> ir.Proc:
+        """Re-layout an on-chip buffer whose axis 0 is a multiple of `tile` (default `hw.pmax`) as
+        `[tile, T, ...]`: row `tile*t + r` moves to `[r, t, ...]`. This is how a block of several
+        partition tiles (e.g. a 512-row PSUM accumulator or output tile) is held on a 128-partition
+        memory. Every access must split cleanly: its axis-0 offset is `tile*q + r` with `q` free of
+        the loops that sweep within a tile and `r` provably inside `[0, tile)`; windows must not
+        straddle a tile boundary."""
+        b = ir.buffers_of(proc)[buf]
+        if b.role != "temp":
+            raise ScheduleError(f"fold({buf}): only temporaries can be re-laid out")
+        tile = self.hw.pmax if tile is None else tile
+        rows = self._const(b.shape[0], f"fold({buf}): axis 0 of '{buf}'")
+        if rows % tile or rows == tile:
+            raise ScheduleError(f"fold({buf}): axis 0 has {rows} rows, which must be a multiple (> 1) of the tile size {tile}")
+        ranges = loop_ranges(proc.body)
+
+        def divide(e: Aff, size: Aff):
+            q, r = Aff(e.const // tile), Aff(e.const % tile)
+            for atom, c in e.terms:
+                if c % tile == 0:
+                    q = q + Aff.of(atom) * (c // tile)
+                else:
+                    r = r + Aff.of(atom) * c
+            try:
+                lo, span = dim_interval(r, ranges)
+            except AnalysisError as ex:
+                raise ScheduleError(f"fold({buf}): {ex}") from None
+            if not (lo.is_const and span.is_const and size.is_const) or lo.const < 0 or lo.const + span.const + size.const - 1 > tile:
+                raise ScheduleError(
+                    f"fold({buf}): axis-0 access '{e}' (window size {size}) is not confined to one {tile}-row tile; "
+                    f"split the loop that indexes axis 0 by {tile} first")
+            return q, r
+
+        def fidx(idx):
+            q, r = divide(idx[0], Aff(1))
+            return (r, q) + tuple(idx[1:])
+
+        def fwin(w):
+            q, r = divide(w.lo[0], w.size[0])
+            pts = tuple(sorted([p + 1 if p >= 1 else p for p in w.points] + [1]))
+            return ir.Window(w.buf, (r, q) + tuple(w.lo[1:]), (w.size[0], Aff(1)) + tuple(w.size[1:]), pts)
+
+        def remap(s):
+            if isinstance(s, ir.For):
+                return replace(s, body=tuple(remap(x) for x in s.body))
+            if isinstance(s, ir.Alloc) and s.buf.name == buf:
+                return ir.Alloc(b.with_(shape=(Aff(tile), Aff(rows // tile)) + tuple(b.shape[1:])))
+            if isinstance(s, (ir.Assign, ir.Reduce)):
+                rhs = ir._remap_expr(s.rhs, buf, buf, fidx)
+                return type(s)(s.buf, fidx(s.idx) if s.buf == buf else s.idx, rhs)
+            if isinstance(s, ir.Call):
+                return ir.Call(s.instr, tuple((rl, fwin(w) if w.buf == buf else w) for rl, w in s.args), s.attrs)
+            return s
+
+        return proc.with_(body=tuple(remap(x) for x in proc.body))
+
     def _staging(self, tensor, at, mem, name, direction):
         at_loop = self._find(at)
         self._fresh(name)
@@ -453,20 +514,51 @@ class Sched:
         if found.get("init") != 1:
             raise ScheduleError(f"fold_init({buf}): expected exactly one full zero-initialisation nest, found {found.get('init', 0)}")
         n_mm = []
+        bufs = ir.buffers_of(self.proc)
 
-        def f(s):
-            if isinstance(s, ir.Call) and s.instr == "ns.tensor.matmul" and s.arg("dst").buf == buf:
-                if not s.arg("dst").is_full(bufs):
-                    raise ScheduleError(f"fold_init({buf}): matmul writes only part of '{buf}'; first-write-overwrite would be unsound")
-                n_mm.append(1)
-                return replace(s, attrs=tuple((k, v) for k, v in s.attrs if k != "accumulate") + (("accumulate", None),))
-            return None
+        def rec2(stmts, stack):
+            out = []
+            for s in stmts:
+                if isinstance(s, ir.For):
+                    s = replace(s, body=tuple(rec2(s.body, stack + [s])))
+                elif isinstance(s, ir.Call) and s.instr == "ns.tensor.matmul" and s.arg("dst").buf == buf:
+                    if not self._tiles_buffer(s.arg("dst"), bufs[buf], {l.var: l.extent for l in stack}):
+                        raise ScheduleError(
+                            f"fold_init({buf}): the matmuls do not write every element of '{buf}' as non-overlapping whole tiles; "
+                            f"first-write-overwrite would leave stale data")
+                    n_mm.append(1)
+                    s = replace(s, attrs=tuple((k, v) for k, v in s.attrs if k != "accumulate") + (("accumulate", None),))
+                out.append(s)
+            return out
 
-        body = tuple(ir.map_stmts(body, f))
+        body = tuple(rec2(body, []))
         if not n_mm:
             raise ScheduleError(f"fold_init({buf}): no ns.tensor.matmul accumulates into '{buf}' (replace the update nest first)")
         # every other access to buf must be a read after the matmuls (checked by the oracle step too)
         self._commit(f"fold_init({buf})", self.proc.with_(body=body))
+
+    @staticmethod
+    def _tiles_buffer(w: ir.Window, b: ir.Buffer, loops: dict) -> bool:
+        """Do the windows `w` takes as the enclosing `loops` run tile `b` exactly (every element
+        once per sweep of the loops that move it)? Per dimension the moving loop coefficients must
+        form a mixed-radix system starting at the window size and ending at the buffer extent."""
+        for d, (lo, z) in enumerate(zip(w.lo, w.size)):
+            full = b.shape[d]
+            if not (full.is_const and z.is_const and lo.const == 0):
+                return False
+            terms = []
+            for atom, c in lo.terms:
+                if not (isinstance(atom, Var) and atom.name in loops and loops[atom.name].is_const):
+                    return False
+                terms.append((c, loops[atom.name].const))
+            span = z.const
+            for c, ext in sorted(terms):
+                if c != span:
+                    return False
+                span *= ext
+            if span != full.const:
+                return False
+        return True
 
     def hoist(self, buf: str, to: Optional[str]):
         """Re-stage `buf` (created by stage_in) at the outer loop `to`: its fill moves out of every
@@ -584,6 +676,52 @@ class Sched:
             new_to = replace(to_loop, body=new_body)
             p = self._rewrite_loop(to, lambda f: (new_to,))
         self._commit(f"hoist({buf}, to={to})", p)
+
+    def set_dma(self, buf: str, dge: str = "hwdge", engine: Optional[str] = "sync"):
+        """Choose how the DMAs that fill or drain `buf` get their descriptors. `hwdge` (the DGE
+        hardware block, driven by the `sync` or `scalar` queue) keeps descriptor generation off the
+        GpSimd engine, which is what `swdge` uses; `none` has the runtime prebuild them. Spreading
+        different buffers over `sync` / `scalar` runs their DMA queues in parallel."""
+        if dge not in DGE_MODES:
+            raise ScheduleError(f"set_dma: dge must be one of {sorted(DGE_MODES)}, got {dge!r}")
+        if dge != "hwdge":
+            engine = None
+        elif engine not in DGE_MODES[dge]:
+            raise ScheduleError(f"set_dma: hwdge descriptors are issued by engine 'sync' or 'scalar', got {engine!r}")
+        self._buf(buf)
+        n = []
+
+        def f(s):
+            if isinstance(s, ir.Call) and s.instr == "ns.sync.dma_copy" and any(w.buf == buf for _, w in s.args):
+                n.append(1)
+                keep = tuple((k, v) for k, v in s.attrs if k not in ("dge", "engine"))
+                new = (("dge", dge),) + ((("engine", engine),) if engine else ())
+                return replace(s, attrs=keep + new)
+            return None
+
+        body = tuple(ir.map_stmts(self.proc.body, f))
+        if not n:
+            raise ScheduleError(f"set_dma({buf}): no DMA copy reads or writes '{buf}' (stage it with stage_in / stage_out first)")
+        self._commit(f"set_dma({buf}, {dge}, {engine})", self.proc.with_(body=body))
+
+    def shard(self, loop: str, cores: int, names=("blk", "core")):
+        """SPMD-parallelise `loop` over `cores` NeuronCores: `loop -> blk*cores + core`, with `core`
+        bound to nl.program_id(0) (and moved outermost when possible). Every program runs the same
+        code on its own interleaved share of the iterations, so the iterations must be independent
+        (the loop must be affine: each one writes a disjoint part of the outputs). The kernel is
+        launched as kernel[cores](...)."""
+        if any(isinstance(x, ir.For) and x.kind == "spmd" for x in ir.walk(self.proc.body)):
+            raise ScheduleError("shard: the kernel already has an spmd loop (one launch axis is supported)")
+        self._find(loop)
+        if ir.find_loop(infer_kinds(self.proc).body, loop).kind != "affine":
+            raise ScheduleError(f"shard({loop}): iterations of '{loop}' are not independent (the loop carries a dependence)")
+        o, c = self.split(loop, cores, names=names, perfect=True)
+        self._commit(f"shard({loop}, {cores})", self._rewrite_loop(c, lambda f: (replace(f, kind="spmd"),)))
+        try:
+            self.reorder(c, o)
+        except ScheduleError:
+            pass
+        return o, c
 
     def mark(self, loop: str, kind: str):
         """Assert (or force a more conservative) loop kind: affine | sequential | static."""
